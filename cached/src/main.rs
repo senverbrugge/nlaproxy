@@ -233,6 +233,70 @@ fn nt_owf(password: &str) -> [u8; 16] {
     out
 }
 
+/// Compute the list of Domain values to emit synonym SAM rows for.
+///
+/// WinPR's `SamAreEntriesEqual` compares Domain byte-exact via `strncmp`, so
+/// we need one row per (username, domain) tuple the client might present.
+/// Real-world NLA clients pick from a surprisingly small set:
+///
+/// * `""`             mstsc on a workgroup PC; xfreerdp without `/d:`; the
+///                    default when no AD domain is configured
+/// * `"."`            Delinea RDP Proxy sometimes uses this to signal
+///                    "the target machine's local SAM"; some Windows
+///                    clients use it as a shorthand for "local"
+/// * `HOSTNAME`       many brokers (Delinea Secret Server, some CyberArk
+///                    configs, Windows domain-joined clients pointing at a
+///                    workgroup target) put the target machine name here
+/// * `HOSTNAME.upper` the same, uppercased - Windows convention
+///
+/// Operators can add more via `NLAPROXY_SAM_DOMAINS=comma,separated,list`.
+/// The empty string is included in that list as literal `""` or by
+/// terminating with a `,`.
+fn sam_domain_variants() -> Vec<String> {
+    let mut out: Vec<String> = Vec::with_capacity(8);
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut add = |v: String| {
+        // Skip domains containing separators that would corrupt the SAM line.
+        if v.bytes().any(|b| b == b':' || b == b'\n' || b == b'\r') {
+            return;
+        }
+        if seen.insert(v.clone()) {
+            out.push(v);
+        }
+    };
+
+    // Always try the empty domain first - the most common case, and the one
+    // WinPR falls back to when a domain-aware lookup misses.
+    add(String::new());
+    add(".".to_owned());
+
+    // Local hostname, lowercase and uppercase. `hostname(2)` may return the
+    // FQDN or a short name depending on the box; try both plus the pre-dot
+    // short form.
+    if let Ok(host) = nix::unistd::gethostname().and_then(|h| {
+        h.into_string()
+            .map_err(|_| nix::errno::Errno::EILSEQ)
+    }) {
+        let short = host.split('.').next().unwrap_or(&host).to_owned();
+        add(host.clone());
+        add(host.to_lowercase());
+        add(host.to_uppercase());
+        add(short.clone());
+        add(short.to_lowercase());
+        add(short.to_uppercase());
+    }
+
+    // Operator-supplied extras. Format: `NLAPROXY_SAM_DOMAINS=WORKGROUP,,EXAMPLE`
+    // (empty entry between commas is a valid empty-domain entry).
+    if let Ok(env) = std::env::var("NLAPROXY_SAM_DOMAINS") {
+        for part in env.split(',') {
+            add(part.to_owned());
+        }
+    }
+
+    out
+}
+
 // ---------------------------------------------------------------------------
 // Cache
 // ---------------------------------------------------------------------------
