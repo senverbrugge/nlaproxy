@@ -355,35 +355,37 @@ impl Cache {
     /// from the incoming AUTHENTICATE_MESSAGE.
     ///
     /// WinPR compares SAM entries via `SamAreEntriesEqual`, which is a **strict
-    /// byte-exact** `strncmp` on both User and Domain. Real-world NLA clients
-    /// (mstsc, PAM/CyberArk workflows, macOS Microsoft Remote Desktop, etc.)
-    /// send the username in whatever casing / prefix the operator typed:
+    /// byte-exact** `strncmp` on both User and Domain. Different NLA clients
+    /// send different combinations:
     ///
-    ///   - `alice`            (bare, most common on Linux targets)
-    ///   - `ALICE`            (uppercased by autofill on some clients)
-    ///   - `Alice`            (title-cased on Windows domain accounts)
-    ///   - `EXAMPLE\alice`    (domain-qualified, some brokers)
-    ///   - `alice@example`    (UPN form)
+    /// * `mstsc` on a workgroup PC:  User=`alice`, Domain=`` (empty)
+    /// * `mstsc` domain-joined:      User=`alice`, Domain=`DOMAIN`
+    /// * FreeRDP `xfreerdp`:         User=`alice`, Domain=`` unless `/d:` given
+    /// * Delinea RDP Proxy (SS):     User=`alice`, Domain=`.` or Domain=`HOST`
+    /// * CyberArk PSM:               varies per config; often Domain=`HOST`
     ///
-    /// To make the SAM lookup survive any of these we emit synonym rows: the
-    /// exact form, the lowercase form, and the uppercase form. This covers the
-    /// three casing variants above. The domain-prefixed and UPN forms have
-    /// their prefix/suffix stripped by the FreeRDP proxy plugin BEFORE it does
-    /// the LOOKUP, but the SAM match happens before our plugin runs, so we
-    /// need WinPR's own fallback: `SamLookupUserA` retries with `domain=NULL`
-    /// if a domain-aware lookup misses. Empty-domain SAM entries therefore
-    /// match any (user, *) tuple, which is exactly what we want.
+    /// Older WinPR (<= 3.24) does a strict `(user, domain)` lookup ONLY - it
+    /// does NOT retry with `domain=NULL`. Newer WinPR does. To be safe on
+    /// every version we explicitly emit one row per (user_casing, domain_form)
+    /// combination.
     ///
-    /// The Domain field of every emitted row is empty. NTLM validation itself
-    /// happens against the NT-hash of the password, which is independent of
-    /// user/domain in NTOWFv1; the domain string is used only for the
-    /// per-request NTOWFv2 derivation `HMAC-MD5(NT-hash, uppercase(user)||domain)`
-    /// on both sides. As long as both sides see the same Domain value the
-    /// derivation matches, so empty-vs-empty is safe.
+    /// Casing variants: exact, lowercase, uppercase (typically collapses to 1-3).
+    /// Domain variants: empty, ".", hostname, uppercase hostname, plus any
+    ///                  values supplied via NLAPROXY_SAM_DOMAINS env (comma-sep).
+    ///
+    /// The NT hash itself is independent of the domain string - NTOWFv1 =
+    /// MD4(UTF-16LE(password)). Domain matters only for the per-request
+    /// NTOWFv2 derivation `HMAC-MD5(NT-hash, uppercase(user)||domain)`, which
+    /// both client and server perform with the same domain value they parsed
+    /// from the AUTHENTICATE_MESSAGE. So as long as our SAM entry's domain
+    /// matches what the client sent, the derivation lines up and NTLM
+    /// succeeds regardless of what the domain string is.
     fn write_sam_file(&self) -> Result<()> {
         let tmp = self.sam_path.with_extension("sam.tmp");
-        let mut contents = String::with_capacity(self.entries.len() * 240);
+        let mut contents = String::with_capacity(self.entries.len() * 512);
         let mut written: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+        let domains = sam_domain_variants();
 
         for (user, entry) in &self.entries {
             // Filter usernames that contain characters that would break the SAM
@@ -393,18 +395,27 @@ impl Cache {
                 warn!(user, "skipping SAM entry with invalid characters");
                 continue;
             }
-            let variants = [user.clone(), user.to_lowercase(), user.to_uppercase()];
-            for v in variants {
-                if v.is_empty() || !written.insert(v.clone()) {
+            let user_variants = [user.clone(), user.to_lowercase(), user.to_uppercase()];
+            for u in &user_variants {
+                if u.is_empty() {
                     continue;
                 }
-                contents.push_str(&v);
-                // Empty domain.
-                contents.push_str("::");
-                // Empty LM hash.
-                contents.push(':');
-                contents.push_str(&hex::encode(entry.nt_hash));
-                contents.push_str(":::\n");
+                for d in &domains {
+                    // Dedup on `user:domain` since the same row would be
+                    // written twice for an ASCII-lower user.
+                    let key = format!("{u}:{d}");
+                    if !written.insert(key) {
+                        continue;
+                    }
+                    contents.push_str(u);
+                    contents.push(':');
+                    contents.push_str(d);
+                    contents.push_str("::");
+                    // Empty LM hash.
+                    contents.push(':');
+                    contents.push_str(&hex::encode(entry.nt_hash));
+                    contents.push_str(":::\n");
+                }
             }
         }
 

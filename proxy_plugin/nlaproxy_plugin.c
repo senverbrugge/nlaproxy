@@ -93,6 +93,7 @@
 
 struct plugin_state {
     char *socket_path;
+    char *sam_path;
     int require_cache;
 };
 
@@ -327,9 +328,61 @@ static BOOL nlaproxy_plugin_unload(proxyPlugin *plugin)
     if (plugin && plugin->custom) {
         struct plugin_state *st = (struct plugin_state *)plugin->custom;
         free(st->socket_path);
+        free(st->sam_path);
         free(st);
         plugin->custom = NULL;
     }
+    return TRUE;
+}
+
+/*
+ * ServerSessionInitialize: called from `pf_server_handle_peer` immediately
+ * after the peer context is initialized and BEFORE NLA runs. This is our
+ * chance to push per-connection settings that the pf_server itself doesn't
+ * wire up.
+ *
+ * Purpose: on FreeRDP < 3.25 (Debian/Ubuntu 24.04 ships 3.24.2), the proxy
+ * parses `SamFile=` from proxy.ini but never actually forwards it to
+ * `FreeRDP_NtlmSamFile` on each peer. That means WinPR's NTLM verifier falls
+ * back to `~/.config/winpr/SAM` and always fails to find the user. Setting
+ * the property here fixes NLA on those older builds. On 3.25+ the proxy sets
+ * this itself but our set is a harmless no-op (identical value).
+ *
+ * `param` is a `freerdp_peer*`.
+ */
+WINPR_ATTR_NODISCARD
+static BOOL nlaproxy_server_session_initialize(proxyPlugin *plugin,
+                                               proxyData *pdata,
+                                               void *param)
+{
+    (void)pdata;
+    if (!plugin || !plugin->custom)
+        return TRUE;
+    struct plugin_state *st = (struct plugin_state *)plugin->custom;
+    if (!st->sam_path || !st->sam_path[0])
+        return TRUE;
+
+    freerdp_peer *peer = (freerdp_peer *)param;
+    if (!peer || !peer->context || !peer->context->settings) {
+        WLog_WARN(TAG, "ServerSessionInitialize: no peer/settings, skipping SAM path push");
+        return TRUE;
+    }
+
+    /* Only set if unset - respects FreeRDP >= 3.25 that already wired the
+     * config value in, and lets operators override via proxy.ini SamFile= on
+     * newer builds. */
+    const char *existing = freerdp_settings_get_string(peer->context->settings,
+                                                        FreeRDP_NtlmSamFile);
+    if (existing && existing[0]) {
+        WLog_DBG(TAG, "NtlmSamFile already set to '%s', leaving it alone", existing);
+        return TRUE;
+    }
+    if (!freerdp_settings_set_string(peer->context->settings,
+                                     FreeRDP_NtlmSamFile, st->sam_path)) {
+        WLog_ERR(TAG, "failed to set FreeRDP_NtlmSamFile to '%s'", st->sam_path);
+        return FALSE;
+    }
+    WLog_INFO(TAG, "pushed NtlmSamFile='%s' onto peer settings", st->sam_path);
     return TRUE;
 }
 
@@ -557,6 +610,24 @@ BOOL proxy_module_entry_point(proxyPluginsManager *plugins_manager, void *userda
         return FALSE;
     }
 
+    /*
+     * SAM file path. We push this onto each incoming peer's
+     * FreeRDP_NtlmSamFile setting in ServerSessionInitialize because
+     * `pf_server` on FreeRDP < 3.25 (Ubuntu 24.04 ships 3.24.2) parses
+     * SamFile= from proxy.ini but never forwards it to the NLA server.
+     *
+     * The default `/run/nlaproxy/users.sam` matches what nlaproxy-cached
+     * writes. Operators can override via the env var, and can disable this
+     * pushdown entirely by setting it to the empty string, letting FreeRDP's
+     * own `SamFile=` parsing take effect (on FreeRDP >= 3.25).
+     */
+    st->sam_path = xstrdup_env_or("NLAPROXY_PLUGIN_SAM", "/run/nlaproxy/users.sam");
+    if (!st->sam_path) {
+        free(st->socket_path);
+        free(st);
+        return FALSE;
+    }
+
     const char *req = getenv("NLAPROXY_PLUGIN_REQUIRE");
     st->require_cache = (req && (req[0] == '0')) ? 0 : 1;
 
@@ -565,17 +636,22 @@ BOOL proxy_module_entry_point(proxyPluginsManager *plugins_manager, void *userda
     plugin.name = PLUGIN_NAME;
     plugin.description = PLUGIN_DESC;
     plugin.PluginUnload = nlaproxy_plugin_unload;
+    plugin.ServerSessionInitialize = nlaproxy_server_session_initialize;
     plugin.ServerPeerLogon = nlaproxy_server_peer_logon;
     plugin.ServerPostConnect = nlaproxy_server_post_connect;
     plugin.ClientLoginFailure = nlaproxy_client_login_failure;
     plugin.userdata = userdata;
     plugin.custom = st;
 
-    WLog_INFO(TAG, "nlaproxy plugin loaded (socket=%s require=%d)",
-              st->socket_path, st->require_cache);
+    WLog_INFO(TAG,
+              "nlaproxy plugin loaded (socket=%s sam=%s require=%d)",
+              st->socket_path,
+              st->sam_path[0] ? st->sam_path : "(unset)",
+              st->require_cache);
 
     if (!plugins_manager->RegisterPlugin(plugins_manager, &plugin)) {
         free(st->socket_path);
+        free(st->sam_path);
         free(st);
         return FALSE;
     }
