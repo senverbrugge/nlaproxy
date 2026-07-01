@@ -552,10 +552,25 @@ static SECURITY_STATUS nlaproxy_ntlm_hash_cb(void *client,
 /*
  * ServerSessionInitialize: called immediately after the peer context is
  * initialized and BEFORE FreeRDP's NLA server bring-up (`client->Initialize`).
- * We use it to install our NTLM hash callback on the peer - which is then
- * copied into `ntlmSettings.hashCallback` by
- * `credssp_auth_setup_identity()` and reaches WinPR's `AcquireCredentialsHandle`
- * as part of the extended auth identity struct.
+ * We do two things here:
+ *
+ *   (1) Install our NTLM hash callback on the peer - which is then copied
+ *       into `ntlmSettings.hashCallback` by `credssp_auth_setup_identity()`
+ *       and reaches WinPR's `AcquireCredentialsHandle` as part of the
+ *       extended auth identity struct.
+ *
+ *   (2) Turn off a couple of optional post-NLA features that some RDP
+ *       proxies (Delinea Secret Server's RDP proxy in particular) do not
+ *       tolerate. Specifically:
+ *
+ *       - `FreeRDP_NetworkAutoDetect` = FALSE.
+ *         Otherwise the proxy sends an auto-detect request PDU right after
+ *         `SECURE_SETTINGS_EXCHANGE` (state `CONNECT_TIME_AUTO_DETECT_REQUEST`).
+ *         Delinea's RDP proxy silently drops the connection here.
+ *
+ *       - `FreeRDP_SupportHeartbeatPdu` = FALSE.
+ *         Same rationale; not all RDP proxies handle heartbeat PDUs and
+ *         they add no value for our use case.
  *
  * `param` is a `freerdp_peer*`.
  */
@@ -576,6 +591,16 @@ static BOOL nlaproxy_server_session_initialize(proxyPlugin *plugin,
 
     peer->SspiNtlmHashCallback = nlaproxy_ntlm_hash_cb;
     WLog_DBG(TAG, "installed SspiNtlmHashCallback on peer");
+
+    if (peer->context && peer->context->settings) {
+        rdpSettings *s = peer->context->settings;
+        /* We ignore failures - these are best-effort tweaks. */
+        (void)freerdp_settings_set_bool(s, FreeRDP_NetworkAutoDetect, FALSE);
+        (void)freerdp_settings_set_bool(s, FreeRDP_SupportHeartbeatPdu, FALSE);
+        WLog_DBG(TAG,
+                 "disabled NetworkAutoDetect and SupportHeartbeatPdu on peer "
+                 "(some RDP proxies reject these post-NLA)");
+    }
     return TRUE;
 }
 
