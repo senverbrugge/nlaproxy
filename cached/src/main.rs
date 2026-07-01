@@ -284,7 +284,19 @@ impl Cache {
     }
 
     fn lookup(&self, username: &str) -> Result<Option<Secret>> {
-        let Some(entry) = self.entries.get(username) else {
+        // Try an exact match first, then fall back to a case-insensitive scan.
+        // We can't rely on the caller (freerdp-proxy plugin -> what CredSSP
+        // reported) using the same casing as the PAM_USER we stored, so we
+        // resolve the entry the same way we emit SAM synonyms - by folded
+        // comparison.
+        let entry = self.entries.get(username).or_else(|| {
+            let folded = username.to_lowercase();
+            self.entries
+                .iter()
+                .find(|(k, _)| k.to_lowercase() == folded)
+                .map(|(_, v)| v)
+        });
+        let Some(entry) = entry else {
             return Ok(None);
         };
         if entry.expires_at <= Instant::now() {
@@ -299,7 +311,21 @@ impl Cache {
     }
 
     fn evict(&mut self, username: &str) -> Result<bool> {
-        let was_present = self.entries.remove(username).is_some();
+        // Same folding logic as lookup - allow the consumer to evict by the
+        // casing it happens to know.
+        let key = if self.entries.contains_key(username) {
+            Some(username.to_owned())
+        } else {
+            let folded = username.to_lowercase();
+            self.entries
+                .keys()
+                .find(|k| k.to_lowercase() == folded)
+                .cloned()
+        };
+        let was_present = match key {
+            Some(k) => self.entries.remove(&k).is_some(),
+            None => false,
+        };
         if was_present {
             self.write_sam_file()?;
         }
@@ -326,13 +352,39 @@ impl Cache {
     /// where NT_HASH_HEX is the hex-encoded NTOWFv1 (`MD4(UTF-16LE(password))`).
     /// FreeRDP's `ntlm_fetch_ntlm_v2_hash` reads this raw NT-hash from the SAM
     /// entry and then derives the NTLMv2 hash on the fly using the user/domain
-    /// from the incoming AUTHENTICATE_MESSAGE. We always write entries with an
-    /// empty domain because mstsc-class clients normally send no AD domain when
-    /// none is configured (and FreeRDP's `SamLookupUserW` falls back to a
-    /// nullptr-domain lookup if the domain-aware match misses).
+    /// from the incoming AUTHENTICATE_MESSAGE.
+    ///
+    /// WinPR compares SAM entries via `SamAreEntriesEqual`, which is a **strict
+    /// byte-exact** `strncmp` on both User and Domain. Real-world NLA clients
+    /// (mstsc, PAM/CyberArk workflows, macOS Microsoft Remote Desktop, etc.)
+    /// send the username in whatever casing / prefix the operator typed:
+    ///
+    ///   - `alice`            (bare, most common on Linux targets)
+    ///   - `ALICE`            (uppercased by autofill on some clients)
+    ///   - `Alice`            (title-cased on Windows domain accounts)
+    ///   - `EXAMPLE\alice`    (domain-qualified, some brokers)
+    ///   - `alice@example`    (UPN form)
+    ///
+    /// To make the SAM lookup survive any of these we emit synonym rows: the
+    /// exact form, the lowercase form, and the uppercase form. This covers the
+    /// three casing variants above. The domain-prefixed and UPN forms have
+    /// their prefix/suffix stripped by the FreeRDP proxy plugin BEFORE it does
+    /// the LOOKUP, but the SAM match happens before our plugin runs, so we
+    /// need WinPR's own fallback: `SamLookupUserA` retries with `domain=NULL`
+    /// if a domain-aware lookup misses. Empty-domain SAM entries therefore
+    /// match any (user, *) tuple, which is exactly what we want.
+    ///
+    /// The Domain field of every emitted row is empty. NTLM validation itself
+    /// happens against the NT-hash of the password, which is independent of
+    /// user/domain in NTOWFv1; the domain string is used only for the
+    /// per-request NTOWFv2 derivation `HMAC-MD5(NT-hash, uppercase(user)||domain)`
+    /// on both sides. As long as both sides see the same Domain value the
+    /// derivation matches, so empty-vs-empty is safe.
     fn write_sam_file(&self) -> Result<()> {
         let tmp = self.sam_path.with_extension("sam.tmp");
-        let mut contents = String::with_capacity(self.entries.len() * 80);
+        let mut contents = String::with_capacity(self.entries.len() * 240);
+        let mut written: std::collections::HashSet<String> = std::collections::HashSet::new();
+
         for (user, entry) in &self.entries {
             // Filter usernames that contain characters that would break the SAM
             // line format (`:` is the field separator). These should never make
@@ -341,13 +393,19 @@ impl Cache {
                 warn!(user, "skipping SAM entry with invalid characters");
                 continue;
             }
-            contents.push_str(user);
-            // Empty domain.
-            contents.push_str("::");
-            // Empty LM hash.
-            contents.push(':');
-            contents.push_str(&hex::encode(entry.nt_hash));
-            contents.push_str(":::\n");
+            let variants = [user.clone(), user.to_lowercase(), user.to_uppercase()];
+            for v in variants {
+                if v.is_empty() || !written.insert(v.clone()) {
+                    continue;
+                }
+                contents.push_str(&v);
+                // Empty domain.
+                contents.push_str("::");
+                // Empty LM hash.
+                contents.push(':');
+                contents.push_str(&hex::encode(entry.nt_hash));
+                contents.push_str(":::\n");
+            }
         }
 
         // Write atomically with restrictive permissions.

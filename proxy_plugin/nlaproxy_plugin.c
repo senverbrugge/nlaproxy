@@ -401,16 +401,55 @@ static BOOL nlaproxy_server_post_connect(proxyPlugin *plugin,
     }
 
     /*
-     * Username CredSSP authenticated. The proxy will already have populated
-     * FreeRDP_Username from the CredSSP identity. We trust that value.
+     * Username CredSSP authenticated. FreeRDP_Username is populated by the
+     * NLA server from the AUTHENTICATE_MESSAGE. FreeRDP_Domain is what the
+     * client's identity carried in the same message; it may be empty.
      */
-    const char *user = freerdp_settings_get_string(front, FreeRDP_Username);
-    if (!user || user[0] == '\0') {
+    const char *raw_user = freerdp_settings_get_string(front, FreeRDP_Username);
+    const char *raw_domain = freerdp_settings_get_string(front, FreeRDP_Domain);
+    if (!raw_user || raw_user[0] == '\0') {
         WLog_WARN(TAG, "ServerPostConnect: no username on front settings; skipping");
         return st->require_cache ? FALSE : TRUE;
     }
-    const char *domain = freerdp_settings_get_string(front, FreeRDP_Domain);
-    if (!domain) domain = "";
+    if (!raw_domain) raw_domain = "";
+
+    WLog_INFO(TAG,
+              "ServerPostConnect: CredSSP identity = user='%s' domain='%s'",
+              raw_user, raw_domain);
+
+    /*
+     * Some NLA clients (older mstsc, some Java RDP libs, and certain PAM
+     * brokers) put the domain-qualified username into the User field with an
+     * empty Domain field, e.g.
+     *     User='EXAMPLE\alice'  Domain=''
+     *     User='alice@example.com'  Domain=''
+     * Split those before caching-lookup so we key by the bare account name,
+     * which is what the SSH-side pam_nlaproxy captured.
+     */
+    char user_buf[256];
+    const char *user = raw_user;
+    const char *bslash = strchr(raw_user, '\\');
+    const char *at = strchr(raw_user, '@');
+    if (bslash && bslash > raw_user) {
+        /* DOMAIN\user - take the tail. */
+        const char *tail = bslash + 1;
+        strncpy(user_buf, tail, sizeof(user_buf) - 1);
+        user_buf[sizeof(user_buf) - 1] = '\0';
+        user = user_buf;
+        WLog_DBG(TAG, "stripped DOMAIN\\ prefix: '%s' -> '%s'", raw_user, user);
+    } else if (at && at > raw_user) {
+        /* user@REALM - take the head. */
+        size_t n = (size_t)(at - raw_user);
+        if (n >= sizeof(user_buf)) n = sizeof(user_buf) - 1;
+        memcpy(user_buf, raw_user, n);
+        user_buf[n] = '\0';
+        user = user_buf;
+        WLog_DBG(TAG, "stripped @REALM suffix: '%s' -> '%s'", raw_user, user);
+    }
+
+    /* Domain forwarded to xrdp: empty by default (xrdp doesn't care) unless
+     * the client sent one explicitly. */
+    const char *domain = raw_domain;
 
     WLog_DBG(TAG, "ServerPostConnect: looking up cached password for user '%s'", user);
 
@@ -419,8 +458,9 @@ static BOOL nlaproxy_server_post_connect(proxyPlugin *plugin,
     if (rc == 1) {
         WLog_WARN(TAG,
                   "no cached credentials for user '%s' - "
-                  "the user must SSH to this host first within the cache TTL",
-                  user);
+                  "the user must SSH to this host first within the cache TTL "
+                  "(sent by client as user='%s' domain='%s')",
+                  user, raw_user, raw_domain);
         if (st->require_cache)
             return FALSE;
         return TRUE;
@@ -432,7 +472,9 @@ static BOOL nlaproxy_server_post_connect(proxyPlugin *plugin,
         return TRUE;
     }
 
-    /* We have the plaintext. Inject into the upstream settings. */
+    /* We have the plaintext. Inject into the upstream settings. Forward the
+     * bare (post-strip) username so xrdp receives the Linux account name in
+     * the Client Info PDU. */
     BOOL ok = TRUE;
     if (!freerdp_settings_set_string(back, FreeRDP_Username, user))
         ok = FALSE;
