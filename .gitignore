@@ -1,2 +1,4 @@
 pam_nlaproxy.so
 proxy-nlaproxy-plugin.so
+target/
+.session-cache
