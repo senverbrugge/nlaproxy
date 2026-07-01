@@ -1,0 +1,15 @@
+# systemd-sysusers(8) - creates the unprivileged user used by nlaproxy-freerdp
+# and the shared group used to gate access to /run/nlaproxy.
+#
+# Install at /usr/lib/sysusers.d/nlaproxy.conf and run
+#   systemd-sysusers
+# Or just install once via the install.sh script in this directory.
+#
+# The order matters: `g` first so the group exists, then `u nlaproxy` will
+# implicitly bind the user's primary group to the `nlaproxy` group of the
+# same name (per sysusers.d(5): "The user's primary group will be set to the
+# group bearing the same name").
+
+# Type  Name       ID  GECOS                       Home  Shell
+g       nlaproxy   -
+u       nlaproxy   -   "nlaproxy NLA proxy"        /     /usr/sbin/nologin

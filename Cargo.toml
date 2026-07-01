@@ -1,0 +1,15 @@
+[workspace]
+resolver = "2"
+members = ["cached"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.80"
+license = "MIT"
+repository = "https://github.com/anomalyco/nlaproxy"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true

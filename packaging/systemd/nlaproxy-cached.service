@@ -1,0 +1,100 @@
+# nlaproxy credential cache daemon.
+#
+# Listens on /run/nlaproxy/cached.sock. Receives STORE requests from the
+# pam_nlaproxy.so PAM module (called from sshd as root) and LOOKUP requests
+# from the freerdp-proxy3 plugin running under the `nlaproxy` user. Maintains
+# the NTLM SAM file at /run/nlaproxy/users.sam which freerdp-proxy3 reads
+# for server-side NLA validation.
+#
+# Runs as root because:
+#   1. STORE callers (sshd) connect as root and we use SO_PEERCRED to enforce
+#      that, so we must be able to accept root peers (any uid works, but
+#      systemd's User= can interfere with that on some kernels via SCM_CREDS
+#      translation).
+#   2. We need to chown the socket so the unprivileged freerdp-proxy3 service
+#      can connect.
+# The process is otherwise tightly sandboxed below.
+
+[Unit]
+Description=nlaproxy credential cache daemon
+Documentation=https://github.com/anomalyco/nlaproxy
+After=network-pre.target
+Before=sshd.service nlaproxy-freerdp.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/nlaproxy-cached
+Restart=on-failure
+RestartSec=2s
+
+# We stay running as UID 0 (see the SO_PEERCRED note in the header comment)
+# but set the primary GID to `nlaproxy`. This makes:
+#   * RuntimeDirectory=/run/nlaproxy be created as root:nlaproxy 0750
+#   * new files (users.sam, cached.sock) inherit that group so freerdp-proxy3
+#     under User=nlaproxy can read them
+Group=nlaproxy
+
+# Runtime directory: systemd creates /run/nlaproxy with mode 0750 and chowns
+# to the service's User:Group. Since User= is unset (defaults to root) and
+# Group=nlaproxy above, the resulting perms are root:nlaproxy 0750.
+RuntimeDirectory=nlaproxy
+RuntimeDirectoryMode=0750
+RuntimeDirectoryPreserve=no
+
+# Environment (override via systemctl edit nlaproxy-cached.service):
+Environment=NLAPROXY_SOCKET=/run/nlaproxy/cached.sock
+Environment=NLAPROXY_SAM=/run/nlaproxy/users.sam
+Environment=NLAPROXY_CONSUMER_USER=nlaproxy
+Environment=NLAPROXY_CONSUMER_GROUP=nlaproxy
+Environment=NLAPROXY_TTL_SECS=300
+Environment=RUST_LOG=info
+
+# --- sandbox ---
+# We deliberately keep root capability because of the SO_PEERCRED reasoning
+# above, but drop every other privilege.
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateDevices=true
+PrivateTmp=true
+PrivateUsers=false
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectHostname=true
+ProtectClock=true
+ProtectProc=invisible
+ProcSubset=pid
+
+LockPersonality=true
+MemoryDenyWriteExecute=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+RestrictNamespaces=true
+RestrictAddressFamilies=AF_UNIX
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@mount @debug @reboot @swap @raw-io @cpu-emulation @obsolete
+
+# We hold sensitive data in memory; refuse to swap.
+LimitMEMLOCK=infinity
+# Disable core dumps which would leak cached passwords.
+LimitCORE=0
+
+# Capabilities: none needed beyond what root naturally has minus the bounding set.
+CapabilityBoundingSet=
+AmbientCapabilities=
+
+# Filesystem - we write to /run/nlaproxy only.
+ReadWritePaths=/run/nlaproxy
+
+# Networking - Unix sockets only.
+PrivateNetwork=true
+IPAddressDeny=any
+
+# Don't write coredumps to disk via systemd-coredump either.
+CoredumpFilter=0
+
+[Install]
+WantedBy=multi-user.target

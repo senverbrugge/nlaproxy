@@ -1,0 +1,35 @@
+# nlaproxy PAM lines for /etc/pam.d/sshd.
+#
+# TWO lines are required. The `auth` line snapshots the typed password while
+# it is still in PAM_AUTHTOK, before later modules (or sshd itself) scrub it.
+# The `session` line replays it to the cache daemon once the session opens.
+#
+# Both lines must come AFTER the real authenticator (pam_unix, pam_sss, etc.):
+#
+#   Debian / Ubuntu                  RHEL / Fedora / Arch
+#   ───────────────                  ────────────────────
+#   @include common-auth             auth       substack    password-auth
+#   auth   optional pam_nlaproxy.so  auth       optional    pam_nlaproxy.so
+#   ...                              ...
+#   @include common-session          session    include     password-auth
+#   session optional pam_nlaproxy.so session    optional    pam_nlaproxy.so
+#
+# Both lines are `optional`, so if our module errors or the daemon is down,
+# the SSH login still succeeds normally. The module itself also returns
+# PAM_SUCCESS / PAM_IGNORE on every error path as a belt-and-braces.
+#
+# After editing /etc/pam.d/sshd, restart sshd:
+#   systemctl restart sshd
+#
+# To verify:
+#   1. ssh user@host (forcing password auth, no keys)
+#        ssh -o PreferredAuthentications=password -o PubkeyAuthentication=no \
+#            user@host
+#   2. journalctl -t pam_nlaproxy --since '1 min ago'
+#      → "pam_nlaproxy(auth): snapshotted PAM_AUTHTOK for user <name> (<n> bytes)"
+#      → "pam_nlaproxy: cached credentials for user <name>"
+#   3. sudo cat /run/nlaproxy/users.sam
+#      → one line per cached user.
+
+auth       optional    pam_nlaproxy.so
+session    optional    pam_nlaproxy.so

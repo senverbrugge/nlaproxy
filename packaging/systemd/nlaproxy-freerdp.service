@@ -1,0 +1,92 @@
+# nlaproxy front-end: freerdp-proxy3 with the nlaproxy plugin.
+#
+# Terminates NLA from the Privileged Access Management server on tcp/3389,
+# looks up the matching plaintext password from nlaproxy-cached, and forwards
+# the session to xrdp on 127.0.0.1:3390.
+#
+# Runs as the unprivileged `nlaproxy` user. It needs read access to:
+#   - /etc/nlaproxy/proxy.ini
+#   - /etc/xrdp/cert.pem and /etc/xrdp/key.pem (or its own cert if configured)
+#   - the nlaproxy-cached Unix socket at /run/nlaproxy/cached.sock
+#     (granted via membership in the `nlaproxy` group)
+#
+# And write access to:
+#   - /var/lib/nlaproxy-freerdp/  (fake $HOME for freerdp's per-user config /
+#     known_hosts fingerprint cache; systemd creates it via StateDirectory=)
+
+[Unit]
+Description=nlaproxy NLA front-end (freerdp-proxy3)
+Documentation=https://github.com/anomalyco/nlaproxy
+After=network-online.target nlaproxy-cached.service xrdp.service
+Wants=network-online.target nlaproxy-cached.service
+Requires=nlaproxy-cached.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/freerdp-proxy3 /etc/nlaproxy/proxy.ini
+Restart=on-failure
+RestartSec=5s
+
+User=nlaproxy
+Group=nlaproxy
+
+# freerdp-proxy3 calls GetKnownPath(KNOWN_PATH_HOME) during peer context init
+# (to locate ~/.config/freerdp/known_hosts.v2, TLS fingerprint cache, etc.).
+# With ProtectHome=true and no HOME we would fail every connection with:
+#     [ERROR][com.freerdp.core.peer] - [freerdp_peer_context_new_ex]:
+#         ContextNew callback failed
+# Give the service a dedicated writable state dir and point HOME at it.
+StateDirectory=nlaproxy-freerdp
+StateDirectoryMode=0700
+Environment=HOME=/var/lib/nlaproxy-freerdp
+Environment=XDG_CONFIG_HOME=/var/lib/nlaproxy-freerdp/.config
+Environment=XDG_CACHE_HOME=/var/lib/nlaproxy-freerdp/.cache
+Environment=XDG_DATA_HOME=/var/lib/nlaproxy-freerdp/.local/share
+
+# Point the plugin at our daemon. The plugin reads these on dlopen().
+Environment=NLAPROXY_PLUGIN_SOCKET=/run/nlaproxy/cached.sock
+Environment=NLAPROXY_PLUGIN_REQUIRE=1
+# Quiet down FreeRDP's WLog: switch to WARN by default (override with
+# `systemctl edit nlaproxy-freerdp.service` if you need protocol traces).
+Environment=WLOG_LEVEL=WARN
+
+# Bind to a privileged port without running as root.
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+
+# --- sandbox ---
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateDevices=true
+PrivateTmp=true
+PrivateUsers=false
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectHostname=true
+ProtectClock=true
+ProtectProc=invisible
+ProcSubset=pid
+
+LockPersonality=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+RestrictNamespaces=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@mount @debug @reboot @swap @raw-io @cpu-emulation @obsolete
+
+# The only writable path we need is the state directory (managed by
+# StateDirectory= above). Explicitly clear ReadWritePaths so a future change
+# to ProtectSystem doesn't accidentally re-enable writes elsewhere.
+# (StateDirectory= implicitly adds /var/lib/<name> to ReadWritePaths.)
+
+# Avoid leaking session memory via coredumps.
+LimitCORE=0
+CoredumpFilter=0
+
+[Install]
+WantedBy=multi-user.target
