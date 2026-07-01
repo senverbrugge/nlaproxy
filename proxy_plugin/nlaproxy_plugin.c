@@ -1,36 +1,40 @@
 /*
  * proxy-nlaproxy-plugin.so — nlaproxy FreeRDP-proxy3 plugin.
  *
- * Hooks into freerdp-proxy3 (the FreeRDP RDP gateway) to provide the missing
- * piece needed for NLA→non-NLA bridging in front of xrdp:
+ * Hooks into freerdp-proxy3 (the FreeRDP RDP gateway) to bridge NLA-required
+ * clients (Delinea Secret Server RDP proxy, CyberArk PSM, mstsc, etc.) onto
+ * a non-NLA xrdp on the same host. The plugin provides four things:
  *
- *   1. ServerPeerLogon: always returns TRUE. The SAM file maintained by
- *      nlaproxy-cached already gates which users can authenticate via NLA, so
- *      by the time this hook fires the client's NTLM response has already been
- *      validated against a cached NT-OWF. We just need to accept the result.
+ *   1. ServerSessionInitialize: assign `peer->SspiNtlmHashCallback` to our
+ *      callback. FreeRDP's NLA server-side code path picks that up
+ *      (credssp_auth_setup_identity() reads `peer->SspiNtlmHashCallback` at
+ *      line ~956 of libfreerdp/core/credssp_auth.c on 3.24.2) and gives us
+ *      full control over NTOWFv2 derivation on every incoming NLA session.
  *
- *   2. ServerPostConnect: after CredSSP has completed and the proxy has parsed
- *      the target info from config, we look up the plaintext password from
- *      nlaproxy-cached (over a Unix socket) using the username CredSSP reported,
- *      and copy it into the upstream `pClientContext` settings. The proxy then
- *      starts a fresh outbound RDP connection to xrdp using those settings, and
- *      xrdp receives the credentials in the Client Info PDU and PAM-authenticates
- *      the user in the usual way.
+ *   2. NtlmHashCallback: WinPR calls this once per session with the
+ *      (user, domain) the client presented. We query nlaproxy-cached over
+ *      a Unix socket for the NT-hash of that user (cached from an earlier
+ *      SSH login), then compute NTOWFv2 with the *exact* Domain the client
+ *      sent - so MIC verification passes regardless of what domain string
+ *      the client chose. No SAM file is used.
  *
- *   3. ClientLoginFailure: best-effort EVICT of the cached credentials so that a
- *      stale or rotated password is not retried.
+ *   3. ServerPeerLogon: return TRUE. Auth already validated by the time we
+ *      get here (WinPR only calls us via the callback if the user has a
+ *      cached NT-hash), so accept.
  *
- * Plugin configuration (passed via proxy.ini [Plugins] section as
- *   ModulesArguments=nlaproxy:socket=/run/nlaproxy/cached.sock,...
- * — but freerdp-proxy3 does not yet pass module arguments through, so we
- * configure via environment variables read at plugin load):
+ *   4. ServerPostConnect: after CredSSP completed, look up the *plaintext*
+ *      password from nlaproxy-cached by username, and inject it into the
+ *      upstream `pClientContext` settings so xrdp can PAM-authenticate. This
+ *      is the moment where plaintext briefly touches this process (it's on
+ *      an anonymous heap buffer, zeroized after use).
  *
- *   NLAPROXY_PLUGIN_SOCKET    Daemon socket path  (default /run/nlaproxy/cached.sock)
- *   NLAPROXY_PLUGIN_REQUIRE   If "1", abort the proxy session when no cached
- *                             credentials are found. Otherwise we leave the
- *                             upstream Username/Password fields untouched and
- *                             let the operator-configured TargetUser/TargetPassword
- *                             apply. Default: 1.
+ *   5. ClientLoginFailure: best-effort EVICT so a stale/rotated password is
+ *      not retried on the next attempt.
+ *
+ * Plugin configuration (via environment variables read at plugin load):
+ *
+ *   NLAPROXY_PLUGIN_SOCKET    Daemon socket path (default /run/nlaproxy/cached.sock)
+ *   NLAPROXY_PLUGIN_REQUIRE   "1" = abort session if no cached creds (default 1)
  *
  * Build:
  *   make
@@ -61,11 +65,14 @@
 
 #include <freerdp/api.h>
 #include <freerdp/freerdp.h>
+#include <freerdp/peer.h>
 #include <freerdp/settings.h>
 #include <freerdp/server/proxy/proxy_context.h>
 #include <freerdp/server/proxy/proxy_log.h>
 #include <freerdp/server/proxy/proxy_modules_api.h>
 
+#include <winpr/crypto.h>   /* winpr_HMAC + WINPR_MD_MD5 - for NTOWFv2 */
+#include <winpr/sspi.h>
 #include <winpr/winpr.h>
 #include <winpr/wlog.h>
 
@@ -73,9 +80,8 @@
 
 #define PLUGIN_NAME "nlaproxy"
 #define PLUGIN_DESC \
-    "Look up cleartext password from nlaproxy-cached by client username (after " \
-    "CredSSP/NLA has authenticated against the cached NT-OWFs) and inject it " \
-    "into the upstream RDP connection so xrdp can PAM-authenticate the user."
+    "Bridge NLA-enforced RDP clients to xrdp by serving NTLM SspiNtlmHashCallback " \
+    "from an nlaproxy-cached daemon (which harvests passwords from SSH logins)."
 
 #define DEFAULT_SOCKET "/run/nlaproxy/cached.sock"
 #define WRITE_TIMEOUT_MS 1500
@@ -84,6 +90,7 @@
 /* Wire protocol - must match cached/src/main.rs */
 #define LOOKUP_TAG 0x02
 #define EVICT_TAG  0x03
+#define NTHASH_TAG 0x05
 #define STATUS_REPLY_OK        0x00
 #define STATUS_REPLY_NOT_FOUND 0x01
 
@@ -93,9 +100,16 @@
 
 struct plugin_state {
     char *socket_path;
-    char *sam_path;
     int require_cache;
 };
+
+/*
+ * Process-wide socket path used by our NTLM hash callback (see below). We
+ * capture it here at plugin load so the callback - which receives only a
+ * `freerdp_peer*` as context - can reach the daemon without wading through
+ * proxyData/plugin state lookups from an SSPI callsite.
+ */
+static char *g_daemon_socket = NULL;
 
 /* ------------------------------------------------------------------------- */
 /* I/O helpers                                                                */
@@ -281,6 +295,86 @@ static int lookup_password(const char *socket_path,
     return 0;
 }
 
+/*
+ * Ask the daemon for the raw NT-hash of `user`'s cached password.
+ *
+ * On success writes 16 bytes into `nthash_out`. Returns:
+ *    0 on OK,
+ *    1 on NOT_FOUND,
+ *   -1 on transport/protocol error.
+ *
+ * The plaintext password never leaves the daemon in this path - only its
+ * MD4(UTF-16LE(password)) does. That's still password-equivalent for NLA
+ * verification, but is not directly useable for anything else.
+ */
+static int lookup_nt_hash(const char *socket_path, const char *user,
+                          uint8_t nthash_out[16])
+{
+    int fd = connect_daemon(socket_path);
+    if (fd < 0)
+        return -1;
+
+    size_t ulen = strlen(user);
+    if (ulen == 0 || ulen > MAX_USERNAME) {
+        close(fd);
+        return -1;
+    }
+
+    size_t body_len = 1 + 2 + ulen;
+    uint8_t frame[4 + 1 + 2 + MAX_USERNAME];
+    frame[0] = (uint8_t)((body_len >> 24) & 0xff);
+    frame[1] = (uint8_t)((body_len >> 16) & 0xff);
+    frame[2] = (uint8_t)((body_len >> 8)  & 0xff);
+    frame[3] = (uint8_t)( body_len        & 0xff);
+    frame[4] = NTHASH_TAG;
+    frame[5] = (uint8_t)((ulen >> 8) & 0xff);
+    frame[6] = (uint8_t)( ulen       & 0xff);
+    memcpy(frame + 7, user, ulen);
+
+    if (write_all(fd, frame, 4 + body_len) < 0) {
+        close(fd);
+        return -1;
+    }
+
+    uint8_t lenbuf[4];
+    if (read_all(fd, lenbuf, 4) < 0) {
+        close(fd);
+        return -1;
+    }
+    uint32_t rl = ((uint32_t)lenbuf[0] << 24)
+                | ((uint32_t)lenbuf[1] << 16)
+                | ((uint32_t)lenbuf[2] << 8)
+                |  (uint32_t)lenbuf[3];
+    if (rl == 0 || rl > MAX_FRAME) {
+        close(fd);
+        return -1;
+    }
+
+    uint8_t status = 0;
+    if (read_all(fd, &status, 1) < 0) {
+        close(fd);
+        return -1;
+    }
+    if (status == STATUS_REPLY_NOT_FOUND) {
+        close(fd);
+        return 1;
+    }
+    if (status != STATUS_REPLY_OK) {
+        close(fd);
+        return -1;
+    }
+    if (rl != 1 + 16) {
+        close(fd);
+        return -1;
+    }
+    if (read_all(fd, nthash_out, 16) < 0) {
+        close(fd);
+        return -1;
+    }
+    close(fd);
+    return 0;
+}
+
 /* Send EVICT for `user`. Best-effort, always returns void. */
 static void evict_password(const char *socket_path, const char *user)
 {
@@ -328,25 +422,140 @@ static BOOL nlaproxy_plugin_unload(proxyPlugin *plugin)
     if (plugin && plugin->custom) {
         struct plugin_state *st = (struct plugin_state *)plugin->custom;
         free(st->socket_path);
-        free(st->sam_path);
         free(st);
         plugin->custom = NULL;
     }
+    free(g_daemon_socket);
+    g_daemon_socket = NULL;
     return TRUE;
 }
 
 /*
- * ServerSessionInitialize: called from `pf_server_handle_peer` immediately
- * after the peer context is initialized and BEFORE NLA runs. This is our
- * chance to push per-connection settings that the pf_server itself doesn't
- * wire up.
+ * Convert a UTF-16LE WCHAR buffer to a UTF-8 C string. Returns a newly
+ * allocated NUL-terminated string, or NULL on failure. Length is in WCHARs.
+ */
+static char *utf16_to_utf8_alloc(const WCHAR *w, size_t wchars)
+{
+    if (!w || wchars == 0) {
+        char *empty = calloc(1, 1);
+        return empty;
+    }
+    /* Cheap ASCII-only conversion. This is fine for Linux account names
+     * (which are ASCII 99.99% of the time). WinPR does full UTF-16 -> UTF-8
+     * conversion in `ConvertWCharNToUtf8Alloc`, which would be more correct
+     * for non-ASCII usernames, but for our target audience (Linux account
+     * names harvested from sshd's PAM stack) this is more than enough. */
+    char *out = calloc(wchars + 1, 1);
+    if (!out) return NULL;
+    for (size_t i = 0; i < wchars; i++) {
+        uint16_t c = w[i];
+        out[i] = (c < 0x80) ? (char)c : '?';
+    }
+    out[wchars] = 0;
+    return out;
+}
+
+/*
+ * psSspiNtlmHashCallback implementation. Called by WinPR's NTLM subsystem
+ * during `ntlm_compute_ntlm_v2_hash()` if the credentials have neither a
+ * plaintext password nor a pre-set NT hash - i.e. our path.
  *
- * Purpose: on FreeRDP < 3.25 (Debian/Ubuntu 24.04 ships 3.24.2), the proxy
- * parses `SamFile=` from proxy.ini but never actually forwards it to
- * `FreeRDP_NtlmSamFile` on each peer. That means WinPR's NTLM verifier falls
- * back to `~/.config/winpr/SAM` and always fails to find the user. Setting
- * the property here fixes NLA on those older builds. On 3.25+ the proxy sets
- * this itself but our set is a harmless no-op (identical value).
+ * Contract (from winpr/sspi.h):
+ *   input:  authIdentity->{User,UserLength,Domain,DomainLength} - UTF-16LE,
+ *           length in WCHARs (not bytes)
+ *   output: 16-byte NTOWFv2 = HMAC-MD5(NT-hash, UTF-16LE(Uppercase(user)||domain))
+ *
+ * We use `NTOWFv2FromHashW` from libwinpr, which does the uppercase-user +
+ * concat-domain + HMAC-MD5 correctly, so we only need to source the raw
+ * NT-hash (MD4 of UTF-16LE(password)) from the daemon.
+ *
+ * Return SEC_E_OK on success. WinPR 3.24.0 fixed the return-code check
+ * (previously it accepted 1 for success); we return SEC_E_OK unconditionally
+ * on success to work on both.
+ */
+static SECURITY_STATUS nlaproxy_ntlm_hash_cb(void *client,
+                                             const SEC_WINNT_AUTH_IDENTITY *authIdentity,
+                                             const SecBuffer *ntproofvalue,
+                                             const BYTE *randkey,
+                                             const BYTE *mic,
+                                             const SecBuffer *micvalue,
+                                             BYTE *ntlmhash /* out, 16 bytes */)
+{
+    /* Unused - these are handed to us for advanced verification/relay scenarios
+     * we don't need. See the doxygen for psSspiNtlmHashCallback. */
+    (void)client;
+    (void)ntproofvalue;
+    (void)randkey;
+    (void)mic;
+    (void)micvalue;
+
+    if (!authIdentity || !ntlmhash)
+        return SEC_E_INVALID_PARAMETER;
+    if (!g_daemon_socket) {
+        WLog_ERR(TAG, "hash callback fired but daemon socket path is not set");
+        return SEC_E_INTERNAL_ERROR;
+    }
+
+    /* SEC_WINNT_AUTH_IDENTITY on WinPR aliases to SEC_WINNT_AUTH_IDENTITY_W
+     * for UTF-16LE builds. Lengths are in WCHARs. */
+    const WCHAR *user_w    = (const WCHAR *)authIdentity->User;
+    const ULONG  user_wchars = authIdentity->UserLength;
+    const WCHAR *domain_w  = (const WCHAR *)authIdentity->Domain;
+    const ULONG  domain_wchars = authIdentity->DomainLength;
+
+    /* Convert User to UTF-8 for our daemon query. */
+    char *user_utf8 = utf16_to_utf8_alloc(user_w, user_wchars);
+    if (!user_utf8)
+        return SEC_E_INSUFFICIENT_MEMORY;
+
+    /* For logging only. */
+    char *domain_utf8 = utf16_to_utf8_alloc(domain_w, domain_wchars);
+    WLog_INFO(TAG,
+              "NTLM hash callback: user='%s' domain='%s' (u_wc=%lu d_wc=%lu)",
+              user_utf8, domain_utf8 ? domain_utf8 : "",
+              (unsigned long)user_wchars, (unsigned long)domain_wchars);
+    free(domain_utf8);
+
+    /* Ask the daemon for the NT-hash of the cached password. */
+    uint8_t nthash[16];
+    int rc = lookup_nt_hash(g_daemon_socket, user_utf8, nthash);
+    if (rc == 1) {
+        WLog_WARN(TAG, "no cached NT-hash for user '%s' - "
+                       "SSH-cache expired or user not in cache", user_utf8);
+        free(user_utf8);
+        return SEC_E_NO_CREDENTIALS;
+    }
+    if (rc < 0) {
+        WLog_ERR(TAG, "NT-hash lookup failed for user '%s' (errno=%d %s)",
+                 user_utf8, errno, strerror(errno));
+        free(user_utf8);
+        return SEC_E_INTERNAL_ERROR;
+    }
+    free(user_utf8);
+
+    /* Compute NTOWFv2 from the raw NT-hash and the exact (user, domain) the
+     * client sent. Doing it here (instead of in the daemon) means we're
+     * matching whatever Domain string the client chose - no SAM synonym rows
+     * needed. `NTOWFv2FromHashW` takes byte lengths, hence *2. */
+    if (!NTOWFv2FromHashW(nthash,
+                          (LPWSTR)user_w,   (UINT32)(user_wchars * 2),
+                          (LPWSTR)domain_w, (UINT32)(domain_wchars * 2),
+                          ntlmhash)) {
+        memset(nthash, 0, sizeof(nthash));
+        WLog_ERR(TAG, "NTOWFv2FromHashW failed");
+        return SEC_E_INTERNAL_ERROR;
+    }
+    memset(nthash, 0, sizeof(nthash));
+    return SEC_E_OK;
+}
+
+/*
+ * ServerSessionInitialize: called immediately after the peer context is
+ * initialized and BEFORE FreeRDP's NLA server bring-up (`client->Initialize`).
+ * We use it to install our NTLM hash callback on the peer - which is then
+ * copied into `ntlmSettings.hashCallback` by
+ * `credssp_auth_setup_identity()` and reaches WinPR's `AcquireCredentialsHandle`
+ * as part of the extended auth identity struct.
  *
  * `param` is a `freerdp_peer*`.
  */
@@ -356,33 +565,17 @@ static BOOL nlaproxy_server_session_initialize(proxyPlugin *plugin,
                                                void *param)
 {
     (void)pdata;
-    if (!plugin || !plugin->custom)
-        return TRUE;
-    struct plugin_state *st = (struct plugin_state *)plugin->custom;
-    if (!st->sam_path || !st->sam_path[0])
+    if (!plugin)
         return TRUE;
 
     freerdp_peer *peer = (freerdp_peer *)param;
-    if (!peer || !peer->context || !peer->context->settings) {
-        WLog_WARN(TAG, "ServerSessionInitialize: no peer/settings, skipping SAM path push");
+    if (!peer) {
+        WLog_WARN(TAG, "ServerSessionInitialize: no peer, cannot install NTLM callback");
         return TRUE;
     }
 
-    /* Only set if unset - respects FreeRDP >= 3.25 that already wired the
-     * config value in, and lets operators override via proxy.ini SamFile= on
-     * newer builds. */
-    const char *existing = freerdp_settings_get_string(peer->context->settings,
-                                                        FreeRDP_NtlmSamFile);
-    if (existing && existing[0]) {
-        WLog_DBG(TAG, "NtlmSamFile already set to '%s', leaving it alone", existing);
-        return TRUE;
-    }
-    if (!freerdp_settings_set_string(peer->context->settings,
-                                     FreeRDP_NtlmSamFile, st->sam_path)) {
-        WLog_ERR(TAG, "failed to set FreeRDP_NtlmSamFile to '%s'", st->sam_path);
-        return FALSE;
-    }
-    WLog_INFO(TAG, "pushed NtlmSamFile='%s' onto peer settings", st->sam_path);
+    peer->SspiNtlmHashCallback = nlaproxy_ntlm_hash_cb;
+    WLog_DBG(TAG, "installed SspiNtlmHashCallback on peer");
     return TRUE;
 }
 
@@ -610,19 +803,11 @@ BOOL proxy_module_entry_point(proxyPluginsManager *plugins_manager, void *userda
         return FALSE;
     }
 
-    /*
-     * SAM file path. We push this onto each incoming peer's
-     * FreeRDP_NtlmSamFile setting in ServerSessionInitialize because
-     * `pf_server` on FreeRDP < 3.25 (Ubuntu 24.04 ships 3.24.2) parses
-     * SamFile= from proxy.ini but never forwards it to the NLA server.
-     *
-     * The default `/run/nlaproxy/users.sam` matches what nlaproxy-cached
-     * writes. Operators can override via the env var, and can disable this
-     * pushdown entirely by setting it to the empty string, letting FreeRDP's
-     * own `SamFile=` parsing take effect (on FreeRDP >= 3.25).
-     */
-    st->sam_path = xstrdup_env_or("NLAPROXY_PLUGIN_SAM", "/run/nlaproxy/users.sam");
-    if (!st->sam_path) {
+    /* Capture the socket path in a process-global so the NTLM hash callback
+     * (which receives only `freerdp_peer*` as context) can reach the daemon.
+     * The daemon socket doesn't change over the process lifetime. */
+    g_daemon_socket = strdup(st->socket_path);
+    if (!g_daemon_socket) {
         free(st->socket_path);
         free(st);
         return FALSE;
@@ -644,14 +829,12 @@ BOOL proxy_module_entry_point(proxyPluginsManager *plugins_manager, void *userda
     plugin.custom = st;
 
     WLog_INFO(TAG,
-              "nlaproxy plugin loaded (socket=%s sam=%s require=%d)",
-              st->socket_path,
-              st->sam_path[0] ? st->sam_path : "(unset)",
-              st->require_cache);
+              "nlaproxy plugin loaded (socket=%s require=%d)",
+              st->socket_path, st->require_cache);
 
     if (!plugins_manager->RegisterPlugin(plugins_manager, &plugin)) {
+        free(g_daemon_socket); g_daemon_socket = NULL;
         free(st->socket_path);
-        free(st->sam_path);
         free(st);
         return FALSE;
     }

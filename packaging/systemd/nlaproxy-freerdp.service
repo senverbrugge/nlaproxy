@@ -43,9 +43,9 @@ Environment=XDG_CONFIG_HOME=/var/lib/nlaproxy-freerdp/.config
 Environment=XDG_CACHE_HOME=/var/lib/nlaproxy-freerdp/.cache
 Environment=XDG_DATA_HOME=/var/lib/nlaproxy-freerdp/.local/share
 
-# Point the plugin at our daemon. The plugin reads these on dlopen().
+# Point the plugin at our daemon. The plugin reads this on dlopen(), and it
+# is also used at runtime to answer NLA's psSspiNtlmHashCallback.
 Environment=NLAPROXY_PLUGIN_SOCKET=/run/nlaproxy/cached.sock
-Environment=NLAPROXY_PLUGIN_SAM=/run/nlaproxy/users.sam
 Environment=NLAPROXY_PLUGIN_REQUIRE=1
 # Quiet down FreeRDP's WLog: switch to WARN by default (override with
 # `systemctl edit nlaproxy-freerdp.service` if you need protocol traces).

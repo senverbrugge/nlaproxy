@@ -55,6 +55,7 @@ use zeroize::{Zeroize, ZeroizeOnDrop};
 //     LOOKUP (0x02): u16_be ulen | username
 //     EVICT  (0x03): u16_be ulen | username
 //     PING   (0x04): (empty)
+//     NTHASH (0x05): u16_be ulen | username
 //
 // Reply payload:
 //     u8 status | optional body
@@ -66,6 +67,12 @@ use zeroize::{Zeroize, ZeroizeOnDrop};
 //     status 0x04 = INTERNAL_ERROR
 //
 //     LOOKUP OK body: u16_be plen | password (UTF-8)
+//     NTHASH OK body: 16 bytes (NT-OWFv1 = MD4(UTF-16LE(password)))
+//
+// The NTHASH command is a strictly less privileged variant of LOOKUP: it
+// exposes only the NT-hash of the cached password, never the plaintext. The
+// freerdp-proxy plugin uses it to answer NLA's psSspiNtlmHashCallback so that
+// the plaintext never leaves this daemon.
 
 const MAX_FRAME: usize = 65_536;
 
@@ -73,6 +80,7 @@ const TAG_STORE: u8 = 0x01;
 const TAG_LOOKUP: u8 = 0x02;
 const TAG_EVICT: u8 = 0x03;
 const TAG_PING: u8 = 0x04;
+const TAG_NTHASH: u8 = 0x05;
 
 const STATUS_OK: u8 = 0x00;
 const STATUS_NOT_FOUND: u8 = 0x01;
@@ -374,6 +382,25 @@ impl Cache {
         Ok(Some(Secret(plaintext)))
     }
 
+    /// Look up the NT-OWFv1 (`MD4(UTF-16LE(password))`) for a cached user.
+    ///
+    /// Returns just the 16-byte hash. Used by the freerdp-proxy plugin to
+    /// answer WinPR's `psSspiNtlmHashCallback` without ever handling the
+    /// plaintext. Same case-folded lookup as `lookup()`.
+    fn nt_hash_of(&self, username: &str) -> Option<[u8; 16]> {
+        let entry = self.entries.get(username).or_else(|| {
+            let folded = username.to_lowercase();
+            self.entries
+                .iter()
+                .find(|(k, _)| k.to_lowercase() == folded)
+                .map(|(_, v)| v)
+        })?;
+        if entry.expires_at <= Instant::now() {
+            return None;
+        }
+        Some(entry.nt_hash)
+    }
+
     fn evict(&mut self, username: &str) -> Result<bool> {
         // Same folding logic as lookup - allow the consumer to evict by the
         // casing it happens to know.
@@ -621,6 +648,25 @@ impl Server {
                     self.reply_status(&mut stream, STATUS_BAD_REQUEST).await?;
                 }
             },
+            TAG_NTHASH => match parse_username(body) {
+                Ok(user) => match self.cache.lock().await.nt_hash_of(&user) {
+                    Some(hash) => {
+                        debug!(user, "NT hash returned to consumer");
+                        let mut reply = Vec::with_capacity(1 + 16);
+                        reply.push(STATUS_OK);
+                        reply.extend_from_slice(&hash);
+                        self.reply_raw(&mut stream, &reply).await?;
+                    }
+                    None => {
+                        debug!(user, "no cached NT hash");
+                        self.reply_status(&mut stream, STATUS_NOT_FOUND).await?;
+                    }
+                },
+                Err(e) => {
+                    warn!(error = ?e, "malformed NTHASH");
+                    self.reply_status(&mut stream, STATUS_BAD_REQUEST).await?;
+                }
+            },
             _ => {
                 warn!(tag, "unknown tag");
                 self.reply_status(&mut stream, STATUS_BAD_REQUEST).await?;
@@ -637,7 +683,7 @@ impl Server {
         }
         match tag {
             // Only the consumer (freerdp-proxy3) may lookup or evict.
-            TAG_LOOKUP | TAG_EVICT | TAG_PING => self.consumer_uid == Some(uid),
+            TAG_LOOKUP | TAG_EVICT | TAG_PING | TAG_NTHASH => self.consumer_uid == Some(uid),
             // STORE is reserved for root (the PAM module runs as sshd, i.e. root).
             TAG_STORE => false,
             _ => false,

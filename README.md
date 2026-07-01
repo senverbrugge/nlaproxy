@@ -212,8 +212,7 @@ Arguments (apply to both stacks):
 
 | Env var                    | Default                          | Notes                                      |
 |----------------------------|----------------------------------|--------------------------------------------|
-| `NLAPROXY_PLUGIN_SOCKET`   | `/run/nlaproxy/cached.sock`      | Daemon socket to query                     |
-| `NLAPROXY_PLUGIN_SAM`      | `/run/nlaproxy/users.sam`        | SAM file path pushed onto each peer as `FreeRDP_NtlmSamFile`. Required on FreeRDP < 3.25 (Ubuntu 24.04's freerdp3 3.24.2) where proxy.ini's `SamFile=` is silently ignored. Set to empty to disable the pushdown. |
+| `NLAPROXY_PLUGIN_SOCKET`   | `/run/nlaproxy/cached.sock`      | Daemon socket to query. Used both at plugin load and per-session by the NTLM `SspiNtlmHashCallback`. |
 | `NLAPROXY_PLUGIN_REQUIRE`  | `1`                              | If `1`, abort the session when no cache hit |
 
 ## Security model and limitations
