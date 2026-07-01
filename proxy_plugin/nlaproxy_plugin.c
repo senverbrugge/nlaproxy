@@ -52,6 +52,7 @@
 
 #define _GNU_SOURCE
 #include <errno.h>
+#include <pthread.h>
 #include <stdarg.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -110,6 +111,94 @@ struct plugin_state {
  * proxyData/plugin state lookups from an SSPI callsite.
  */
 static char *g_daemon_socket = NULL;
+
+/*
+ * Per-session `(freerdp_peer* -> username)` map.
+ *
+ * WHY THIS EXISTS:
+ * During NLA, WinPR invokes our `SspiNtlmHashCallback` with the User field
+ * from the client's AUTHENTICATE_MESSAGE (the ACTUAL Linux account the
+ * client is authenticating as - e.g. `ngh-del-la-01`).
+ *
+ * Later, in `nla_decrypt_ts_credentials()` (FreeRDP core), the proxy decrypts
+ * the TSPasswordCreds `authInfo` blob the client sent and OVERWRITES
+ * `settings->{Username,Password,Domain}` with what's inside.
+ *
+ * For a direct NLA client that's harmless - it's the same identity. But for a
+ * relaying RDP proxy like Delinea Secret Server's PSM, the client authenticates
+ * to Delinea with the real vault account name, then Delinea forwards the RDP
+ * stream to us but replaces the `authInfo` with its own one-time UUID/token.
+ * By the time `ServerPostConnect` runs, `settings->Username` is that UUID,
+ * not the account we want to log into on xrdp.
+ *
+ * So we stash the real username - the one WinPR saw during NLA - keyed by
+ * `freerdp_peer*` (which is stable for the session), and retrieve it in
+ * `ServerPostConnect`. If it's absent (e.g. NLA wasn't used), we fall back
+ * to `FreeRDP_Username`.
+ */
+struct session_user {
+    freerdp_peer *peer;
+    char *user;
+    struct session_user *next;
+};
+static struct session_user *g_sessions = NULL;
+static pthread_mutex_t g_sessions_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static void session_remember(freerdp_peer *peer, const char *user)
+{
+    if (!peer || !user)
+        return;
+    pthread_mutex_lock(&g_sessions_lock);
+    struct session_user *s;
+    for (s = g_sessions; s; s = s->next) {
+        if (s->peer == peer) {
+            free(s->user);
+            s->user = strdup(user);
+            pthread_mutex_unlock(&g_sessions_lock);
+            return;
+        }
+    }
+    s = calloc(1, sizeof(*s));
+    if (!s) {
+        pthread_mutex_unlock(&g_sessions_lock);
+        return;
+    }
+    s->peer = peer;
+    s->user = strdup(user);
+    s->next = g_sessions;
+    g_sessions = s;
+    pthread_mutex_unlock(&g_sessions_lock);
+}
+
+static char *session_take(freerdp_peer *peer)
+{
+    if (!peer)
+        return NULL;
+    pthread_mutex_lock(&g_sessions_lock);
+    struct session_user **pp = &g_sessions;
+    while (*pp) {
+        if ((*pp)->peer == peer) {
+            struct session_user *s = *pp;
+            *pp = s->next;
+            char *u = s->user;
+            free(s);
+            pthread_mutex_unlock(&g_sessions_lock);
+            return u; /* caller owns */
+        }
+        pp = &(*pp)->next;
+    }
+    pthread_mutex_unlock(&g_sessions_lock);
+    return NULL;
+}
+
+static void session_forget(freerdp_peer *peer)
+{
+    char *u = session_take(peer);
+    if (u) {
+        memset(u, 0, strlen(u));
+        free(u);
+    }
+}
 
 /* ------------------------------------------------------------------------- */
 /* I/O helpers                                                                */
@@ -427,6 +516,18 @@ static BOOL nlaproxy_plugin_unload(proxyPlugin *plugin)
     }
     free(g_daemon_socket);
     g_daemon_socket = NULL;
+    /* Free any leftover session map entries. */
+    pthread_mutex_lock(&g_sessions_lock);
+    while (g_sessions) {
+        struct session_user *s = g_sessions;
+        g_sessions = s->next;
+        if (s->user) {
+            memset(s->user, 0, strlen(s->user));
+            free(s->user);
+        }
+        free(s);
+    }
+    pthread_mutex_unlock(&g_sessions_lock);
     return TRUE;
 }
 
@@ -483,11 +584,17 @@ static SECURITY_STATUS nlaproxy_ntlm_hash_cb(void *client,
 {
     /* Unused - these are handed to us for advanced verification/relay scenarios
      * we don't need. See the doxygen for psSspiNtlmHashCallback. */
-    (void)client;
     (void)ntproofvalue;
     (void)randkey;
     (void)mic;
     (void)micvalue;
+
+    /* `client` is what credssp_auth stored as `hashCallbackArg` - which is the
+     * `freerdp_peer*` (see credssp_auth.c line 959). We use it as the session
+     * key for our (peer -> username) stash so ServerPostConnect can retrieve
+     * the same username later, bypassing anything Delinea's proxy may have
+     * rewritten into `settings->Username` via the TSPasswordCreds forwarding. */
+    freerdp_peer *peer = (freerdp_peer *)client;
 
     if (!authIdentity || !ntlmhash)
         return SEC_E_INVALID_PARAMETER;
@@ -515,6 +622,13 @@ static SECURITY_STATUS nlaproxy_ntlm_hash_cb(void *client,
               user_utf8, domain_utf8 ? domain_utf8 : "",
               (unsigned long)user_wchars, (unsigned long)domain_wchars);
     free(domain_utf8);
+
+    /* Remember the real username for this session, so ServerPostConnect can
+     * look up the plaintext password by the SAME identity WinPR just used to
+     * derive the NTLMv2 hash - not the potentially-rewritten Username in
+     * settings. */
+    if (peer)
+        session_remember(peer, user_utf8);
 
     /* Ask the daemon for the NT-hash of the cached password. */
     uint8_t nthash[16];
@@ -637,11 +751,11 @@ static BOOL nlaproxy_server_post_connect(proxyPlugin *plugin,
                                          proxyData *pdata,
                                          void *param)
 {
-    (void)param; /* `param` is freerdp_peer*, but we get the front via pdata. */
     if (!plugin || !plugin->custom || !pdata)
         return FALSE;
 
     struct plugin_state *st = (struct plugin_state *)plugin->custom;
+    freerdp_peer *peer = (freerdp_peer *)param;
 
     /*
      * proxyData exposes pointers to the front/back contexts. The exact public
@@ -672,20 +786,45 @@ static BOOL nlaproxy_server_post_connect(proxyPlugin *plugin,
     }
 
     /*
-     * Username CredSSP authenticated. FreeRDP_Username is populated by the
-     * NLA server from the AUTHENTICATE_MESSAGE. FreeRDP_Domain is what the
-     * client's identity carried in the same message; it may be empty.
+     * Determine the real user we need to log into xrdp as.
+     *
+     * The naive approach - reading FreeRDP_Username from front settings -
+     * is INCORRECT when the client's NLA is being forwarded through a
+     * relaying RDP proxy (Delinea Secret Server, some PSM broker configs).
+     * Those proxies validate the client's NLA against their own vault, then
+     * rewrite the TSPasswordCreds `authInfo` blob with their own one-time
+     * UUID/token before forwarding it to us. `nla_decrypt_ts_credentials()`
+     * then overwrites settings->{Username,Password,Domain} with that garbage.
+     *
+     * The REAL identity the client authenticated as is what WinPR saw during
+     * NLA - the User field of the NTLMv2 AUTHENTICATE_MESSAGE - which we
+     * captured in the SspiNtlmHashCallback and stashed keyed on freerdp_peer*.
      */
-    const char *raw_user = freerdp_settings_get_string(front, FreeRDP_Username);
-    const char *raw_domain = freerdp_settings_get_string(front, FreeRDP_Domain);
-    if (!raw_user || raw_user[0] == '\0') {
-        WLog_WARN(TAG, "ServerPostConnect: no username on front settings; skipping");
-        return st->require_cache ? FALSE : TRUE;
+    char *stashed = session_take(peer);
+    const char *raw_user;
+    if (stashed && stashed[0]) {
+        raw_user = stashed;
+        WLog_DBG(TAG,
+                 "ServerPostConnect: using NLA-captured username '%s' (not settings->Username='%s')",
+                 raw_user,
+                 freerdp_settings_get_string(front, FreeRDP_Username));
+    } else {
+        raw_user = freerdp_settings_get_string(front, FreeRDP_Username);
+        WLog_DBG(TAG,
+                 "ServerPostConnect: no NLA capture, falling back to settings->Username='%s'",
+                 raw_user ? raw_user : "(null)");
     }
+    const char *raw_domain = freerdp_settings_get_string(front, FreeRDP_Domain);
     if (!raw_domain) raw_domain = "";
 
+    if (!raw_user || raw_user[0] == '\0') {
+        WLog_WARN(TAG, "ServerPostConnect: no username available; skipping");
+        free(stashed);
+        return st->require_cache ? FALSE : TRUE;
+    }
+
     WLog_INFO(TAG,
-              "ServerPostConnect: CredSSP identity = user='%s' domain='%s'",
+              "ServerPostConnect: identity to log in as = user='%s' domain='%s'",
               raw_user, raw_domain);
 
     /*
@@ -732,12 +871,16 @@ static BOOL nlaproxy_server_post_connect(proxyPlugin *plugin,
                   "the user must SSH to this host first within the cache TTL "
                   "(sent by client as user='%s' domain='%s')",
                   user, raw_user, raw_domain);
-        if (st->require_cache)
+        if (st->require_cache) {
+            free(stashed);
             return FALSE;
+        }
+        free(stashed);
         return TRUE;
     } else if (rc < 0) {
         WLog_ERR(TAG, "cache lookup failed for user '%s' (errno=%d %s)",
                  user, errno, strerror(errno));
+        free(stashed);
         if (st->require_cache)
             return FALSE;
         return TRUE;
@@ -758,6 +901,9 @@ static BOOL nlaproxy_server_post_connect(proxyPlugin *plugin,
      * copy inside the rdpSettings struct; we don't try to wipe that one. */
     memset(password, 0, strlen(password));
     free(password);
+    /* stashed username no longer needed - it was already consumed for the
+     * lookup, and we've populated the back settings. */
+    free(stashed);
 
     if (!ok) {
         WLog_ERR(TAG, "failed to set upstream credentials for user '%s'", user);
@@ -793,6 +939,25 @@ static BOOL nlaproxy_client_login_failure(proxyPlugin *plugin,
                       user);
             evict_password(st->socket_path, user);
         }
+    }
+    return TRUE;
+}
+
+/*
+ * ServerSessionEnd: called when the session terminates (successfully or not).
+ * We clean up our per-session stash entry to avoid a slow leak.
+ *
+ * `param` is a `freerdp_peer*`.
+ */
+WINPR_ATTR_NODISCARD
+static BOOL nlaproxy_server_session_end(proxyPlugin *plugin,
+                                        proxyData *pdata,
+                                        void *param)
+{
+    (void)plugin; (void)pdata;
+    freerdp_peer *peer = (freerdp_peer *)param;
+    if (peer) {
+        session_forget(peer);
     }
     return TRUE;
 }
@@ -850,6 +1015,7 @@ BOOL proxy_module_entry_point(proxyPluginsManager *plugins_manager, void *userda
     plugin.ServerPeerLogon = nlaproxy_server_peer_logon;
     plugin.ServerPostConnect = nlaproxy_server_post_connect;
     plugin.ClientLoginFailure = nlaproxy_client_login_failure;
+    plugin.ServerSessionEnd = nlaproxy_server_session_end;
     plugin.userdata = userdata;
     plugin.custom = st;
 
