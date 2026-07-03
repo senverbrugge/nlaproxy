@@ -14,6 +14,7 @@
 # Then, with operator confirmation, edits:
 #   * /etc/pam.d/sshd       (adds pam_nlaproxy.so session line)
 #   * /etc/xrdp/xrdp.ini    (moves xrdp from 3389 to 3390 and forces TLS + creds)
+#   * /etc/xrdp/startwm.sh  (installs a launcher that finds KDE / Xfce / LXQt / xterm)
 #
 # Re-run is safe; the script is idempotent.
 
@@ -229,6 +230,39 @@ if [[ -e $XRDP_INI ]]; then
     fi
 else
     warn "xrdp.ini not found at $XRDP_INI; ensure xrdp is installed before starting nlaproxy"
+fi
+
+# -------------------------------------------------------------------- xrdp startwm.sh
+
+# Replace /etc/xrdp/startwm.sh with our launcher that prefers KDE Plasma X11
+# but falls back through Xfce, LXQt, and finally xterm - so the pipeline can
+# be validated on a host without a full desktop environment installed.
+#
+# We back up the previous file every time we replace it, and skip the copy
+# if the on-disk file is already byte-identical to ours.
+XRDP_STARTWM=/etc/xrdp/startwm.sh
+NEW_STARTWM="$REPO_ROOT/packaging/config/startwm.sh"
+if [[ -e $XRDP_STARTWM ]] && cmp -s "$NEW_STARTWM" "$XRDP_STARTWM"; then
+    info "$XRDP_STARTWM already up-to-date"
+else
+    if [[ -e $XRDP_STARTWM ]]; then
+        if [[ ${ASSUME_YES:-0} = 1 ]]; then
+            ans=y
+        else
+            printf '\nReplace %s with the nlaproxy launcher (backup will be kept)? [y/N] ' "$XRDP_STARTWM"
+            read -r ans
+        fi
+    else
+        ans=y
+    fi
+    if [[ $ans =~ ^[Yy]$ ]]; then
+        [[ -e $XRDP_STARTWM ]] && \
+            cp "$XRDP_STARTWM" "$XRDP_STARTWM.nlaproxy.bak.$(date +%s)"
+        install -m 0755 -o root -g root "$NEW_STARTWM" "$XRDP_STARTWM"
+        info "$XRDP_STARTWM installed - launches KDE Plasma if present, else Xfce/LXQt/xterm"
+    else
+        warn "left $XRDP_STARTWM alone; you may need to update it manually"
+    fi
 fi
 
 # -------------------------------------------------------------------- enable
