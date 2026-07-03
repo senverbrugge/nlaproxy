@@ -761,6 +761,59 @@ static BOOL nlaproxy_server_peer_logon(proxyPlugin *plugin,
 }
 
 /*
+ * ServerPeerActivate: called every time the front-side peer (Delinea)
+ * becomes active. This includes:
+ *   1. Initial activation after Confirm Active PDU.
+ *   2. Every reactivation triggered by pf_client's proxy_server_reactivate()
+ *      call, which itself is invoked from pf_client_post_connect after xrdp's
+ *      Server Demand Active PDU is parsed.
+ *
+ * The reactivation path is the reason we need this hook. It calls
+ * pf_context_copy_settings(ps->settings, pc->settings), which is essentially
+ * a full memcpy of pf_client's rdpSettings onto pf_server's rdpSettings.
+ * Anything we set on the front settings BEFORE this point (e.g. in
+ * ServerSessionInitialize or ServerPostConnect) is wiped out and replaced
+ * with whatever value the pf_client observed in xrdp's Demand Active PDU.
+ *
+ * ServerPeerActivate fires AFTER that copy, so it's our last-and-final
+ * chance to force settings that must survive to be readable by
+ * fastpath_send_update_pdu() and friends.
+ *
+ * Currently we re-force FreeRDP_FastPathOutput = TRUE. See ServerPostConnect
+ * for the full rationale on why we need to do this (short version: Delinea
+ * fails to advertise the RNS_UD_CS_FASTPATH_OUTPUT capability bit even
+ * though it can decode fast-path output PDUs fine, and xrdp evidently
+ * doesn't advertise it in its Demand Active either, so the reactivation
+ * copy from pc->ps leaves FastPathOutput=FALSE and the first screen update
+ * kills the session).
+ */
+WINPR_ATTR_NODISCARD
+static BOOL nlaproxy_server_peer_activate(proxyPlugin *plugin,
+                                          proxyData *pdata,
+                                          void *param)
+{
+    (void)plugin;
+    (void)pdata;
+    freerdp_peer *peer = (freerdp_peer *)param;
+    if (!peer || !peer->context || !peer->context->settings) {
+        WLog_WARN(TAG, "ServerPeerActivate: no peer settings, skipping");
+        return TRUE;
+    }
+    rdpSettings *front = peer->context->settings;
+
+    const BOOL was_fpo = freerdp_settings_get_bool(front, FreeRDP_FastPathOutput);
+    if (!was_fpo) {
+        (void)freerdp_settings_set_bool(front, FreeRDP_FastPathOutput, TRUE);
+        WLog_INFO(TAG,
+                  "ServerPeerActivate: front FastPathOutput was FALSE (clobbered "
+                  "by pf_context_copy_settings during reactivation), re-forcing to TRUE");
+    } else {
+        WLog_DBG(TAG, "ServerPeerActivate: front FastPathOutput already TRUE");
+    }
+    return TRUE;
+}
+
+/*
  * ServerPostConnect: after CredSSP and before the upstream RDP client thread
  * is started. We look up the plaintext password by the username CredSSP gave
  * us, and inject it into the upstream client settings.
@@ -1092,6 +1145,7 @@ BOOL proxy_module_entry_point(proxyPluginsManager *plugins_manager, void *userda
     plugin.ServerSessionInitialize = nlaproxy_server_session_initialize;
     plugin.ServerPeerLogon = nlaproxy_server_peer_logon;
     plugin.ServerPostConnect = nlaproxy_server_post_connect;
+    plugin.ServerPeerActivate = nlaproxy_server_peer_activate;
     plugin.ClientLoginFailure = nlaproxy_client_login_failure;
     plugin.ServerSessionEnd = nlaproxy_server_session_end;
     plugin.userdata = userdata;
