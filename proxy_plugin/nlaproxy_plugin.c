@@ -899,11 +899,27 @@ static BOOL nlaproxy_server_post_connect(proxyPlugin *plugin,
 
     /* Sanity-log what we ended up setting (without printing the actual
      * password) - lets an operator verify the injection worked when xrdp
-     * doesn't auto-login. */
-    const size_t pw_len = password ? strlen(password) : 0;
+     * doesn't auto-login.
+     *
+     * IMPORTANT: `user` may alias into `stashed` (when no DOMAIN\ or @REALM
+     * stripping happened), so we MUST snapshot every string we want to log
+     * BEFORE we free() either `stashed` or `password`. Otherwise the WLog_INFO
+     * call below prints freed memory and journald garbles or hides the line.
+     */
+    char log_user[256];
+    char log_back_user[256];
+    char log_back_dom[256];
+    strncpy(log_user, user ? user : "(null)", sizeof(log_user) - 1);
+    log_user[sizeof(log_user) - 1] = '\0';
     const char *back_user = freerdp_settings_get_string(back, FreeRDP_Username);
     const char *back_pw   = freerdp_settings_get_string(back, FreeRDP_Password);
     const char *back_dom  = freerdp_settings_get_string(back, FreeRDP_Domain);
+    strncpy(log_back_user, back_user ? back_user : "(null)", sizeof(log_back_user) - 1);
+    log_back_user[sizeof(log_back_user) - 1] = '\0';
+    strncpy(log_back_dom, back_dom ? back_dom : "(null)", sizeof(log_back_dom) - 1);
+    log_back_dom[sizeof(log_back_dom) - 1] = '\0';
+    const size_t pw_len = password ? strlen(password) : 0;
+    const size_t back_pw_len = back_pw ? strlen(back_pw) : 0;
 
     /* Zero the temporary copy of the password. The setting now owns its own
      * copy inside the rdpSettings struct; we don't try to wipe that one. */
@@ -912,19 +928,17 @@ static BOOL nlaproxy_server_post_connect(proxyPlugin *plugin,
     /* stashed username no longer needed - it was already consumed for the
      * lookup, and we've populated the back settings. */
     free(stashed);
+    /* From here on `user`, `raw_user`, and `raw_domain` are dangling if they
+     * aliased into stashed; use the log_* snapshots only. */
 
     if (!ok) {
-        WLog_ERR(TAG, "failed to set upstream credentials for user '%s'", user);
+        WLog_ERR(TAG, "failed to set upstream credentials for user '%s'", log_user);
         return FALSE;
     }
     WLog_INFO(TAG,
               "injected cached credentials for user '%s' into upstream connection "
               "(back settings: Username='%s' Domain='%s' Password.len=%zu; input pw_len=%zu)",
-              user,
-              back_user ? back_user : "(null)",
-              back_dom  ? back_dom  : "(null)",
-              back_pw   ? strlen(back_pw) : 0,
-              pw_len);
+              log_user, log_back_user, log_back_dom, back_pw_len, pw_len);
     return TRUE;
 }
 
