@@ -897,6 +897,14 @@ static BOOL nlaproxy_server_post_connect(proxyPlugin *plugin,
     if (ok && !freerdp_settings_set_string(back, FreeRDP_Password, password))
         ok = FALSE;
 
+    /* Sanity-log what we ended up setting (without printing the actual
+     * password) - lets an operator verify the injection worked when xrdp
+     * doesn't auto-login. */
+    const size_t pw_len = password ? strlen(password) : 0;
+    const char *back_user = freerdp_settings_get_string(back, FreeRDP_Username);
+    const char *back_pw   = freerdp_settings_get_string(back, FreeRDP_Password);
+    const char *back_dom  = freerdp_settings_get_string(back, FreeRDP_Domain);
+
     /* Zero the temporary copy of the password. The setting now owns its own
      * copy inside the rdpSettings struct; we don't try to wipe that one. */
     memset(password, 0, strlen(password));
@@ -909,8 +917,14 @@ static BOOL nlaproxy_server_post_connect(proxyPlugin *plugin,
         WLog_ERR(TAG, "failed to set upstream credentials for user '%s'", user);
         return FALSE;
     }
-    WLog_INFO(TAG, "injected cached credentials for user '%s' into upstream connection",
-              user);
+    WLog_INFO(TAG,
+              "injected cached credentials for user '%s' into upstream connection "
+              "(back settings: Username='%s' Domain='%s' Password.len=%zu; input pw_len=%zu)",
+              user,
+              back_user ? back_user : "(null)",
+              back_dom  ? back_dom  : "(null)",
+              back_pw   ? strlen(back_pw) : 0,
+              pw_len);
     return TRUE;
 }
 
