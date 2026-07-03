@@ -711,9 +711,28 @@ static BOOL nlaproxy_server_session_initialize(proxyPlugin *plugin,
         /* We ignore failures - these are best-effort tweaks. */
         (void)freerdp_settings_set_bool(s, FreeRDP_NetworkAutoDetect, FALSE);
         (void)freerdp_settings_set_bool(s, FreeRDP_SupportHeartbeatPdu, FALSE);
+        /*
+         * Force fast-path output ON for the front-side session. Some upstream
+         * RDP proxies (notably Delinea Secret Server's RDP relay) fail to
+         * advertise the RNS_UD_CS_FASTPATH_OUTPUT bit in their Client Core
+         * Data even though they can decode fast-path output PDUs just fine.
+         * Without this override, FreeRDP's front server aborts as soon as
+         * xrdp sends its first fast-path screen update, with:
+         *
+         *     [fastpath_send_update_pdu]: client does not support fast path
+         *     output
+         *
+         * which kills the session ~2s after the desktop starts drawing.
+         *
+         * This is safe: if the client genuinely cannot decode fast-path
+         * output, the wire will look malformed on their end and they'll
+         * disconnect - identical failure to what we already see. In practice
+         * every RDP client we've encountered handles fast-path output.
+         */
+        (void)freerdp_settings_set_bool(s, FreeRDP_FastPathOutput, TRUE);
         WLog_DBG(TAG,
-                 "disabled NetworkAutoDetect and SupportHeartbeatPdu on peer "
-                 "(some RDP proxies reject these post-NLA)");
+                 "disabled NetworkAutoDetect + SupportHeartbeatPdu, "
+                 "forced FastPathOutput=TRUE on peer settings");
     }
     return TRUE;
 }
@@ -908,6 +927,22 @@ static BOOL nlaproxy_server_post_connect(proxyPlugin *plugin,
     if (ok && !freerdp_settings_set_bool(back, FreeRDP_AutoLogonEnabled, TRUE))
         ok = FALSE;
 
+    /*
+     * Re-force FastPathOutput=TRUE on the FRONT settings. We already set
+     * this in ServerSessionInitialize, but FreeRDP's capability parsing
+     * (which happens after that hook but before this one) may have
+     * overwritten it based on what the client's Confirm Active PDU
+     * declared. Delinea sometimes forgets to set the fast-path output
+     * capability bit even though it can decode fast-path output fine.
+     * Without this, xrdp's first fast-path screen update triggers:
+     *     [fastpath_send_update_pdu]: client does not support fast path
+     *     output
+     * and the session dies ~2s after login. See ServerSessionInitialize
+     * for the full rationale.
+     */
+    if (ok && !freerdp_settings_set_bool(front, FreeRDP_FastPathOutput, TRUE))
+        ok = FALSE;
+
     /* Sanity-log what we ended up setting (without printing the actual
      * password) - lets an operator verify the injection worked when xrdp
      * doesn't auto-login.
@@ -932,6 +967,7 @@ static BOOL nlaproxy_server_post_connect(proxyPlugin *plugin,
     const size_t pw_len = password ? strlen(password) : 0;
     const size_t back_pw_len = back_pw ? strlen(back_pw) : 0;
     const BOOL back_autologon = freerdp_settings_get_bool(back, FreeRDP_AutoLogonEnabled);
+    const BOOL front_fpo     = freerdp_settings_get_bool(front, FreeRDP_FastPathOutput);
 
     /* Zero the temporary copy of the password. The setting now owns its own
      * copy inside the rdpSettings struct; we don't try to wipe that one. */
@@ -949,9 +985,10 @@ static BOOL nlaproxy_server_post_connect(proxyPlugin *plugin,
     }
     WLog_INFO(TAG,
               "injected cached credentials for user '%s' into upstream connection "
-              "(back settings: Username='%s' Domain='%s' Password.len=%zu AutoLogon=%d; input pw_len=%zu)",
+              "(back settings: Username='%s' Domain='%s' Password.len=%zu AutoLogon=%d; "
+              "front settings: FastPathOutput=%d; input pw_len=%zu)",
               log_user, log_back_user, log_back_dom, back_pw_len,
-              back_autologon ? 1 : 0, pw_len);
+              back_autologon ? 1 : 0, front_fpo ? 1 : 0, pw_len);
     return TRUE;
 }
 
