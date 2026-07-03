@@ -33,42 +33,100 @@ RDP-Security and TLS-only-with-cleartext-creds-in-the-Client-Info-PDU.
 
 NLA is a mutual-knowledge handshake: the server must already know the password
 in order to verify the client's NTLM proof. Linux PAM (`pam_authenticate`) can
-*verify* a password but cannot produce one, so a textbook
-"validate NLA via PAM" implementation is mathematically impossible.
+*verify* a password but cannot produce one, so a textbook "validate NLA via
+PAM" implementation is mathematically impossible.
 
 `nlaproxy` works around this by **harvesting passwords from a prior SSH login**:
 
 1. The user (or an automated system) SSH's in to the target with password auth.
-   A small custom PAM module (`pam_nlaproxy.so`) loaded into sshd's `session`
-   stack captures `PAM_AUTHTOK` after auth succeeds and sends it to a local
+   A small custom PAM module (`pam_nlaproxy.so`) captures `PAM_AUTHTOK` on the
+   `auth` stack (before sshd wipes it) and replays it on `session` to the local
    daemon.
-2. The daemon (`nlaproxy-cached`) keeps the cleartext in memory (encrypted with
-   an ephemeral key, TTL 5 min by default), and atomically rewrites
-   `/run/nlaproxy/users.sam` with an NTLMv1-style NT-OWF entry per cached user.
-3. The PAM/CyberArk server now does RDP-NLA to `:3389`. `freerdp-proxy3` reads
-   the SAM file and validates the client's NTLM response against it.
-4. Our FreeRDP plugin (`proxy-nlaproxy-plugin.so`) hooks
-   `ServerPostConnect`, queries the daemon for the plaintext password, and
-   injects it into the upstream RDP settings.
+2. The daemon (`nlaproxy-cached`) keeps the cleartext in memory encrypted with
+   an ephemeral ChaCha20-Poly1305 key, TTL 5 min by default. It also exposes an
+   NTHASH lookup for CredSSP.
+3. The PAM/CyberArk server now does RDP-NLA to `:3389`. `freerdp-proxy3` walks
+   NLA, and our plugin's `SspiNtlmHashCallback` provides the NT-hash on demand,
+   computed from the client's *exact* Domain field so the NTLMv2 MIC always
+   matches (see "NLA validation" below).
+4. Our FreeRDP plugin (`proxy-nlaproxy-plugin.so`) hooks `ServerPostConnect`,
+   queries the daemon for the plaintext password, and injects it into the
+   upstream RDP settings along with `FreeRDP_AutoLogonEnabled=TRUE` so xrdp
+   receives a Client Info PDU with `INFO_AUTOLOGON` set.
 5. `freerdp-proxy3` opens a TLS connection to xrdp on `127.0.0.1:3390`, the
    creds land in the Client Info PDU, xrdp-sesman PAM-authenticates the user
    normally, and the session opens.
 
-The cleartext password never leaves the host. The NT-OWF on tmpfs is wiped on
-daemon shutdown and on entry expiry.
+The cleartext password never leaves the host. The NT-hash is derived on demand
+from the ephemeral-key-encrypted cache and never written to disk.
+
+## The three subtle bugs this project had to solve
+
+If you're reading this because you're building something similar, these are the
+three non-obvious things that will bite you:
+
+### 1. NLA MIC verification: match the client's Domain field exactly
+
+Textbook approach: write an NTLMv1-style SAM file (`user:::nthash:::`) and let
+WinPR do the CredSSP dance. That does not work for a proxy in front of a
+generic RDP client, because NTLMv2 hashes bake in the *Domain* the client sent
+in its NEGOTIATE_MESSAGE. Every RDP client picks a different Domain — mstsc
+sends its own hostname, Delinea sends the target's hostname, other clients send
+`.` or empty. You cannot enumerate all of them.
+
+**Fix:** install `peer->SspiNtlmHashCallback` (`freerdp/peer.h:213`). WinPR
+invokes it inside its NTLMv2 derivation with the exact (User, Domain) the
+client sent. We compute `NTOWFv2FromHashW(nt_hash, user, domain)` on the fly.
+MIC always matches, regardless of what Domain the client chose.
+
+### 2. Delinea's password rewrite: capture identity in the NTLM callback
+
+Delinea PSM is *itself* an NLA relay. It validates the incoming NLA against
+its own vault and then **rewrites the TSPasswordCreds `authInfo` blob with a
+per-session UUID** before forwarding it to us. By the time `ServerPostConnect`
+runs, `settings->Username` and `settings->Password` contain that garbage UUID
+(something like `d0489e30-d18c-4ae9-9b8d-10079bab68b8`), not the real user.
+
+**Fix:** the `SspiNtlmHashCallback` receives the *raw* NTLM AUTHENTICATE_MESSAGE
+identity, which is the real user (Delinea's rewrite happens only to
+TSPasswordCreds, not to NTLM). We stash it in a per-peer session map keyed on
+`freerdp_peer*` and retrieve it in `ServerPostConnect`.
+
+### 3. xrdp autologin and fast-path output need explicit setting flips
+
+Two settings on the pf_client's back-side rdpSettings must be forced TRUE, but
+at very different points in the FreeRDP proxy lifecycle:
+
+- **`FreeRDP_AutoLogonEnabled`** — Without this, FreeRDP's outbound Client Info
+  PDU omits the `INFO_AUTOLOGON` flag, and xrdp treats our connection as
+  "connected but hasn't submitted credentials yet" and displays its login
+  screen. Populating Username/Password is not sufficient. Set this in
+  `ServerPostConnect` on the back settings.
+
+- **`FreeRDP_FastPathOutput`** — Delinea's Confirm Active PDU does not
+  advertise the fast-path output capability bit, even though it decodes
+  fast-path output PDUs fine. Setting it in `ServerPostConnect` on the front
+  settings is not enough: `pf_client_post_connect` later calls
+  `proxy_server_reactivate` → `pf_context_copy_settings(ps->settings,
+  pc->settings)` which is a full `freerdp_settings_copy` that clobbers the
+  setting with whatever xrdp's Demand Active PDU declared. **Fix:** register a
+  `ServerPeerActivate` hook that re-forces `FastPathOutput=TRUE` on the front
+  settings — this hook fires *after* the reactivation copy, so the setting
+  survives to be readable by `fastpath_send_update_pdu`.
 
 ## Components
 
 | Path                                                | Language | Purpose                                                |
 |-----------------------------------------------------|----------|--------------------------------------------------------|
-| `cached/`                                           | Rust     | Credential cache daemon + NTLM SAM file maintainer     |
-| `pam_module/pam_nlaproxy.c`                         | C        | sshd-side PAM session module that captures the password |
-| `proxy_plugin/nlaproxy_plugin.c`                    | C        | `freerdp-proxy3` plugin that injects cached creds       |
+| `cached/`                                           | Rust     | Credential cache daemon + NTLM hash provider           |
+| `pam_module/pam_nlaproxy.c`                         | C        | sshd-side PAM auth+session module (captures the password) |
+| `proxy_plugin/nlaproxy_plugin.c`                    | C        | `freerdp-proxy3` plugin: NTLM hash callback, credential injection, session hooks |
 | `packaging/systemd/nlaproxy-cached.service`         | unit     | Daemon service (root, RuntimeDirectory=nlaproxy)        |
 | `packaging/systemd/nlaproxy-freerdp.service`        | unit     | freerdp-proxy3 service (user=nlaproxy, CAP_NET_BIND)    |
-| `packaging/config/proxy.ini`                        | INI      | freerdp-proxy3 config (NLA front, TLS back)             |
-| `packaging/config/sshd.pam.snippet`                 | PAM      | Line to add to `/etc/pam.d/sshd`                        |
-| `packaging/install/install.sh`                      | bash     | One-shot installer                                     |
+| `packaging/config/proxy.ini`                        | INI      | freerdp-proxy3 config (NLA front on 3389, TLS back to 3390) |
+| `packaging/config/startwm.sh`                       | shell    | xrdp session launcher (KDE → Xfce → LXQt → xterm)      |
+| `packaging/config/sshd.pam.snippet`                 | PAM      | Lines to add to `/etc/pam.d/sshd`                       |
+| `packaging/install/install.sh`                      | bash     | One-shot idempotent installer                          |
 | `packaging/install/nlaproxy.sysusers`               | sysusers | Creates the unprivileged `nlaproxy` system user        |
 
 ## Requirements
@@ -121,6 +179,31 @@ located, install `freerdp3-proxy-modules` (Debian/Ubuntu) or `freerdp` (Arch)
 first — those packages ship the demo plugins that we use as a marker for the
 correct directory, and are what the installer looks for.
 
+### Desktop environment on the target
+
+`xrdp` needs an **X11** session to render into — it cannot proxy Wayland. Our
+`startwm.sh` searches for `startplasma-x11`, `startxfce4`, `startlxqt`, then
+`xterm` in that order.
+
+On **Ubuntu 26.04**, the default `kde-plasma-desktop` metapackage installs the
+Wayland session only. To get an X11 Plasma session:
+
+```sh
+sudo apt install -y plasma-session-x11 dbus-x11
+```
+
+That installs `/usr/bin/startplasma-x11` which our launcher will auto-detect.
+
+For a lighter footprint (or if you don't need KDE specifically):
+
+```sh
+sudo apt install -y xfce4 dbus-x11
+# or
+sudo apt install -y lxqt dbus-x11
+```
+
+You do not need to touch `startwm.sh` — it picks whichever launcher exists.
+
 ## Build and install
 
 ```sh
@@ -149,13 +232,13 @@ goes to `/etc/nlaproxy/proxy.ini.example`).
 
    ```sh
    ssh alice@target              # password auth required
-   sudo cat /run/nlaproxy/users.sam
-   #   alice:::878d8014606cda29677a44efa1353fc7:::
+   sudo journalctl -u nlaproxy-cached --since '10s ago' | grep 'stored'
    ```
 
-   If you see the line, the PAM module is wired in correctly.
+   You should see the daemon log the STORE. That confirms the sshd PAM module
+   is wired in correctly.
 
-2. **NLA front:**
+2. **Front-end NLA:**
 
    ```sh
    xfreerdp3 /v:target:3389 /u:alice /p:'<the same password>' /sec:nla
@@ -163,7 +246,17 @@ goes to `/etc/nlaproxy/proxy.ini.example`).
 
    You should land in the xrdp session.
 
-3. **Diagnostic logs:**
+3. **Back-end xrdp is on the loopback-only port:**
+
+   ```sh
+   sudo ss -tnlp | grep -E ':3389|:3390'
+   # LISTEN  0  4096   0.0.0.0:3389   ...  freerdp-proxy3
+   # LISTEN  0  4096  127.0.0.1:3390  ...  xrdp
+   ```
+
+   3390 must be loopback-only — plaintext credentials pass through it.
+
+4. **Diagnostic logs:**
 
    ```sh
    journalctl -u nlaproxy-cached -u nlaproxy-freerdp -u sshd -u xrdp -f
@@ -178,6 +271,12 @@ goes to `/etc/nlaproxy/proxy.ini.example`).
    sudo systemctl restart nlaproxy-freerdp
    ```
 
+5. **Session log:**
+
+   `~/.xrdp-startwm.log` (in the RDP user's home) shows which launcher fired
+   and any output from the desktop session start-up. Useful when the session
+   opens but the desktop doesn't appear.
+
 ## Configuration knobs
 
 ### Cache daemon (`/etc/systemd/system/nlaproxy-cached.service.d/override.conf`)
@@ -185,9 +284,8 @@ goes to `/etc/nlaproxy/proxy.ini.example`).
 | Env var                    | Default                          | Notes                                      |
 |----------------------------|----------------------------------|--------------------------------------------|
 | `NLAPROXY_SOCKET`          | `/run/nlaproxy/cached.sock`      | Where the daemon listens                   |
-| `NLAPROXY_SAM`             | `/run/nlaproxy/users.sam`        | Where freerdp-proxy3 reads the SAM file    |
-| `NLAPROXY_CONSUMER_USER`   | `nlaproxy`                       | Username allowed to LOOKUP/EVICT           |
-| `NLAPROXY_CONSUMER_GROUP`  | `nlaproxy`                       | Group that owns the socket and SAM file    |
+| `NLAPROXY_CONSUMER_USER`   | `nlaproxy`                       | Username allowed to LOOKUP / EVICT / NTHASH |
+| `NLAPROXY_CONSUMER_GROUP`  | `nlaproxy`                       | Group that owns the socket                 |
 | `NLAPROXY_TTL_SECS`        | `300`                            | How long cached passwords live             |
 
 ### PAM module (`/etc/pam.d/sshd`)
@@ -219,37 +317,37 @@ Arguments (apply to both stacks):
 
 **What `nlaproxy` does and does NOT promise:**
 
-- The plaintext password is held in process memory in
-  `nlaproxy-cached`, encrypted with a per-process random ChaCha20-Poly1305 key,
-  for at most `NLAPROXY_TTL_SECS` seconds. It is not written to disk in any
-  form. On daemon shutdown the cache is wiped (`SIGTERM`/`SIGINT` handler).
-- The NT-OWF in `users.sam` lives on tmpfs (`/run`, courtesy of
-  systemd's `RuntimeDirectory=`). It is **password-equivalent** for NLA
-  purposes and rainbow-table-trivial for weak passwords. Treat the host
-  accordingly:
-  - Restrict who can become `root` or join the `nlaproxy` group (they can read
-    the SAM file).
-  - Use a strong password policy.
-  - Enforce a low `NLAPROXY_TTL_SECS` (5 min is fine for the PAM-server
-    workflow; lower if the broker connects RDP within seconds of SSH).
+- The plaintext password is held in process memory in `nlaproxy-cached`,
+  encrypted with a per-process random ChaCha20-Poly1305 key, for at most
+  `NLAPROXY_TTL_SECS` seconds. It is never written to disk. On daemon shutdown
+  the cache is wiped (`SIGTERM`/`SIGINT` handler).
+- The NT-hash is derived on demand inside the daemon in response to `NTHASH`
+  socket requests from the `nlaproxy` user, and returned in-memory to the
+  FreeRDP plugin. It is never persisted anywhere.
 - The threat model assumes the local host is trusted (only operators and
   services log in to it). An attacker with code execution as `root` can read
   everything; this proxy adds no defence against that.
+- Access to the daemon socket is restricted via `SO_PEERCRED`:
+  - `STORE` (0x01) requires uid 0 (only the PAM module during sshd auth)
+  - `LOOKUP` / `EVICT` / `NTHASH` require uid 0 or the `nlaproxy` group
+    (only `nlaproxy-freerdp` running as that user).
 - Network paths:
   - Front (`PAM server → :3389`) is full NLA: NTLMv2 mutual auth + TLS-tunneled
     CredSSP. Compromise here requires breaking TLS or NTLM.
-  - Back (`proxy → 127.0.0.1:3390`) is TLS only; the cleartext password is
-    inside the Client Info PDU but the tunnel is local-loopback TLS only.
+  - Back (`proxy → 127.0.0.1:3390`) is TLS but loopback-only; the cleartext
+    password is inside the Client Info PDU on the tunnel. Verify 3390 is bound
+    to 127.0.0.1 only.
 
 **Known limitations:**
 
 - **Password must already be in the cache** for an NLA login to succeed. If
   the PAM-server connects without a recent SSH login by the same user,
-  freerdp-proxy3 will fail the CredSSP handshake (no SAM entry → NTLM proof
+  freerdp-proxy3 will fail the CredSSP handshake (no cache entry → NTLM proof
   rejected). Workflow: SSH first, RDP shortly after.
-- **NTLMv1-equivalent strength.** Because we hand the cleartext to xrdp via
-  the Client Info PDU, we cannot benefit from NLA's "the password never leaves
-  the client" property end-to-end. We only get it on the public-facing leg.
+- **The client's NLA session is terminated at the proxy.** Because we hand the
+  cleartext to xrdp via the Client Info PDU on the loopback TLS tunnel, we
+  cannot benefit from NLA's "the password never leaves the client" property
+  end-to-end. We only get it on the public-facing leg.
 - **Drive / printer redirection** through `freerdp-proxy3 → xrdp` is known to
   be brittle in current FreeRDP releases (upstream issues #10667, #12069).
   Default config disables both.
@@ -258,6 +356,8 @@ Arguments (apply to both stacks):
 - **No clustering.** Cache lives in one process on one host. If you have
   multiple front-end hosts you need to SSH to each one (or replicate the
   cache, out of scope).
+- **X11 desktop required on target.** xrdp cannot proxy Wayland. See "Desktop
+  environment on the target" above.
 
 ## Uninstall
 
@@ -273,8 +373,8 @@ sudo rm -rf /etc/nlaproxy
 sudo userdel nlaproxy && sudo groupdel nlaproxy
 sudo systemctl daemon-reload
 
-# Manually undo your /etc/pam.d/sshd and /etc/xrdp/xrdp.ini edits (the
-# installer leaves a timestamped .bak alongside each).
+# Restore /etc/xrdp/startwm.sh, /etc/pam.d/sshd, and /etc/xrdp/xrdp.ini from
+# the timestamped .bak the installer left alongside each.
 ```
 
 ## License
