@@ -896,6 +896,17 @@ static BOOL nlaproxy_server_post_connect(proxyPlugin *plugin,
         ok = FALSE;
     if (ok && !freerdp_settings_set_string(back, FreeRDP_Password, password))
         ok = FALSE;
+    /*
+     * CRITICAL: FreeRDP's outbound Client Info PDU only sets the
+     * INFO_AUTOLOGON flag when settings->AutoLogonEnabled is TRUE (see
+     * libfreerdp/core/info.c:rdp_write_info_packet). Without that flag
+     * xrdp will treat the connection as "user connected but has not yet
+     * submitted credentials" and display its login screen despite the
+     * Password field being populated. Setting Username/Password alone is
+     * NOT sufficient.
+     */
+    if (ok && !freerdp_settings_set_bool(back, FreeRDP_AutoLogonEnabled, TRUE))
+        ok = FALSE;
 
     /* Sanity-log what we ended up setting (without printing the actual
      * password) - lets an operator verify the injection worked when xrdp
@@ -920,6 +931,7 @@ static BOOL nlaproxy_server_post_connect(proxyPlugin *plugin,
     log_back_dom[sizeof(log_back_dom) - 1] = '\0';
     const size_t pw_len = password ? strlen(password) : 0;
     const size_t back_pw_len = back_pw ? strlen(back_pw) : 0;
+    const BOOL back_autologon = freerdp_settings_get_bool(back, FreeRDP_AutoLogonEnabled);
 
     /* Zero the temporary copy of the password. The setting now owns its own
      * copy inside the rdpSettings struct; we don't try to wipe that one. */
@@ -937,8 +949,9 @@ static BOOL nlaproxy_server_post_connect(proxyPlugin *plugin,
     }
     WLog_INFO(TAG,
               "injected cached credentials for user '%s' into upstream connection "
-              "(back settings: Username='%s' Domain='%s' Password.len=%zu; input pw_len=%zu)",
-              log_user, log_back_user, log_back_dom, back_pw_len, pw_len);
+              "(back settings: Username='%s' Domain='%s' Password.len=%zu AutoLogon=%d; input pw_len=%zu)",
+              log_user, log_back_user, log_back_dom, back_pw_len,
+              back_autologon ? 1 : 0, pw_len);
     return TRUE;
 }
 
